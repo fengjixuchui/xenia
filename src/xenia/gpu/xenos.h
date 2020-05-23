@@ -401,6 +401,43 @@ inline int GetVertexFormatSizeInWords(VertexFormat format) {
   }
 }
 
+inline uint32_t GetVertexFormatNeededWords(VertexFormat format,
+                                           uint32_t used_components) {
+  assert_zero(used_components & ~uint32_t(0b1111));
+  if (!used_components) {
+    return 0;
+  }
+  switch (format) {
+    case VertexFormat::k_8_8_8_8:
+    case VertexFormat::k_2_10_10_10:
+      return 0b0001;
+    case VertexFormat::k_10_11_11:
+    case VertexFormat::k_11_11_10:
+      return (used_components & 0b0111) ? 0b0001 : 0b0000;
+    case VertexFormat::k_16_16:
+    case VertexFormat::k_16_16_FLOAT:
+      return (used_components & 0b0011) ? 0b0001 : 0b0000;
+    case VertexFormat::k_16_16_16_16:
+    case VertexFormat::k_16_16_16_16_FLOAT:
+      return ((used_components & 0b0011) ? 0b0001 : 0b0000) |
+             ((used_components & 0b1100) ? 0b0010 : 0b0000);
+    case VertexFormat::k_32:
+    case VertexFormat::k_32_FLOAT:
+      return used_components & 0b0001;
+    case VertexFormat::k_32_32:
+    case VertexFormat::k_32_32_FLOAT:
+      return used_components & 0b0011;
+    case VertexFormat::k_32_32_32_32:
+    case VertexFormat::k_32_32_32_32_FLOAT:
+      return used_components;
+    case VertexFormat::k_32_32_32_FLOAT:
+      return used_components & 0b0111;
+    default:
+      assert_unhandled_case(format);
+      return 0b0000;
+  }
+}
+
 enum class CompareFunction : uint32_t {
   kNever = 0b000,
   kLess = 0b001,
@@ -655,7 +692,7 @@ XEPACKEDUNION(xe_gpu_vertex_fetch_t, {
 // XE_GPU_REG_SHADER_CONSTANT_FETCH_*
 XEPACKEDUNION(xe_gpu_texture_fetch_t, {
   XEPACKEDSTRUCTANONYMOUS({
-    FetchConstantType type : 2;       // +0 dword_0
+    FetchConstantType type : 2;  // +0 dword_0
     // Likely before the swizzle, seems logical from R5xx (SIGNED_COMP0/1/2/3
     // set the signedness of components 0/1/2/3, while SEL_ALPHA/RED/GREEN/BLUE
     // specify "swizzling for each channel at the input of the pixel shader",

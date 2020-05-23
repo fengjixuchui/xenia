@@ -1153,16 +1153,23 @@ void D3D12CommandProcessor::PerformSwap(uint32_t frontbuffer_ptr,
     dirty_gamma_ramp_pwl_ = false;
   }
 
-  D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
-  D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
-  if (RequestViewDescriptors(ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid,
-                             2, 2, descriptor_cpu_start,
-                             descriptor_gpu_start) !=
-      ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-    TextureFormat frontbuffer_format;
-    if (texture_cache_->RequestSwapTexture(descriptor_cpu_start,
-                                           frontbuffer_format)) {
-      render_target_cache_->FlushAndUnbindRenderTargets();
+  D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
+  TextureFormat frontbuffer_format;
+  ID3D12Resource* swap_texture_resource = texture_cache_->RequestSwapTexture(
+      swap_texture_srv_desc, frontbuffer_format);
+  if (swap_texture_resource) {
+    render_target_cache_->FlushAndUnbindRenderTargets();
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
+    D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
+    if (RequestViewDescriptors(ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid,
+                               2, 2, descriptor_cpu_start,
+                               descriptor_gpu_start) !=
+        ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
+      // Must not call anything that can change the descriptor heap from now on!
+
+      // Create the swap texture descriptor.
+      device->CreateShaderResourceView(
+          swap_texture_resource, &swap_texture_srv_desc, descriptor_cpu_start);
 
       // Create the gamma ramp texture descriptor.
       // This is according to D3D::InitializePresentationParameters from a game
@@ -1409,8 +1416,8 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
 
   // Update the textures - this may bind pipelines.
   texture_cache_->RequestTextures(
-      vertex_shader->GetUsedTextureMask(),
-      pixel_shader != nullptr ? pixel_shader->GetUsedTextureMask() : 0);
+      vertex_shader->GetUsedTextureMask() |
+      (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMask() : 0));
 
   // Check if early depth/stencil can be enabled.
   bool early_z;
@@ -1453,6 +1460,7 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature)) {
     return false;
   }
+  // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex and index buffers are resident and draw.
   // TODO(Triang3l): Cache residency for ranges in a way similar to how texture
@@ -2203,11 +2211,6 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(bool primitive_two_faced) {
     viewport_offset_x += float(pa_sc_window_offset.window_x_offset);
     viewport_offset_y += float(pa_sc_window_offset.window_y_offset);
   }
-  if (cvars::d3d12_half_pixel_offset &&
-      !regs.Get<reg::PA_SU_VTX_CNTL>().pix_center) {
-    viewport_offset_x += 0.5f;
-    viewport_offset_y += 0.5f;
-  }
   D3D12_VIEWPORT viewport;
   viewport.TopLeftX =
       (viewport_offset_x - viewport_scale_x) * float(pixel_size_x);
@@ -2323,6 +2326,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
   auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  auto pa_su_vtx_cntl = regs.Get<reg::PA_SU_VTX_CNTL>();
   float rb_alpha_ref = regs[XE_GPU_REG_RB_ALPHA_REF].f32;
   auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
   auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
@@ -2533,7 +2537,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // shaders (for rectangle list drawing, for instance) to the 8192x8192
   // viewport (the maximum render target size) that is used to emulate
   // unnormalized coordinates. Z scale/offset is to convert from OpenGL NDC to
-  // Direct3D NDC if needed.
+  // Direct3D NDC if needed. Also apply half-pixel offset to reproduce Direct3D
+  // 9 rasterization rules - must be done before clipping, not through the
+  // viewport, for SSAA and resolution scale to work correctly.
   float viewport_scale_x = regs[XE_GPU_REG_PA_CL_VPORT_XSCALE].f32;
   float viewport_scale_y = regs[XE_GPU_REG_PA_CL_VPORT_YSCALE].f32;
   // Kill all primitives if multipass or both faces are culled, but still need
@@ -2571,6 +2577,24 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     float ndc_offset_x = pa_cl_vte_cntl.vport_x_offset_ena ? 0.0f : -1.0f;
     float ndc_offset_y = pa_cl_vte_cntl.vport_y_offset_ena ? 0.0f : 1.0f;
     float ndc_offset_z = gl_clip_space_def ? 0.5f : 0.0f;
+    if (cvars::d3d12_half_pixel_offset && !pa_su_vtx_cntl.pix_center) {
+      // Signs are hopefully correct here, tested in GTA IV on both clearing
+      // (without a viewport) and drawing things near the edges of the screen.
+      if (pa_cl_vte_cntl.vport_x_scale_ena) {
+        if (viewport_scale_x != 0.0f) {
+          ndc_offset_x += 0.5f / viewport_scale_x;
+        }
+      } else {
+        ndc_offset_x += 1.0f / 8192.0f;
+      }
+      if (pa_cl_vte_cntl.vport_y_scale_ena) {
+        if (viewport_scale_y != 0.0f) {
+          ndc_offset_y += 0.5f / viewport_scale_y;
+        }
+      } else {
+        ndc_offset_y -= 1.0f / 8192.0f;
+      }
+    }
     dirty |= system_constants_.ndc_scale[0] != ndc_scale_x;
     dirty |= system_constants_.ndc_scale[1] != ndc_scale_y;
     dirty |= system_constants_.ndc_scale[2] != ndc_scale_z;

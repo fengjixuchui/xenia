@@ -109,8 +109,7 @@ class TextureCache {
   // shaders and puts them in the SRV state. This may bind compute pipelines
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
-  void RequestTextures(uint32_t used_vertex_texture_mask,
-                       uint32_t used_pixel_texture_mask);
+  void RequestTextures(uint32_t used_texture_mask);
 
   // Returns the hash of the current bindings (must be called after
   // RequestTextures) for the provided SRV descriptor layout.
@@ -160,8 +159,12 @@ class TextureCache {
                                        uint32_t first_unscaled_4kb_page,
                                        uint32_t unscaled_4kb_page_count);
 
-  bool RequestSwapTexture(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                          TextureFormat& format_out);
+  // Returns the ID3D12Resource of the front buffer texture (in
+  // PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes the
+  // description of its SRV. May call LoadTextureData, so the same restrictions
+  // (such as about descriptor heap change possibility) apply.
+  ID3D12Resource* RequestSwapTexture(
+      D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out, TextureFormat& format_out);
 
  private:
   enum class LoadMode {
