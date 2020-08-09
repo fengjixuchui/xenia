@@ -11,7 +11,9 @@
 #define XENIA_GPU_D3D12_TEXTURE_CACHE_H_
 
 #include <atomic>
+#include <cstring>
 #include <unordered_map>
+#include <utility>
 
 #include "xenia/base/mutex.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
@@ -55,26 +57,99 @@ class D3D12CommandProcessor;
 //   MipAddress but no BaseAddress to save memory because textures are streamed
 //   this way anyway.
 class TextureCache {
+  union TextureKey {
+    struct {
+      // Physical 4 KB page with the base mip level, disregarding A/C/E address
+      // range prefix.
+      uint32_t base_page : 17;             // 17 total
+      xenos::DataDimension dimension : 2;  // 19
+      uint32_t width : 13;                 // 32
+
+      uint32_t height : 13;      // 45
+      uint32_t tiled : 1;        // 46
+      uint32_t packed_mips : 1;  // 47
+      // Physical 4 KB page with mip 1 and smaller.
+      uint32_t mip_page : 17;  // 64
+
+      // Layers for stacked and 3D, 6 for cube, 1 for other dimensions.
+      uint32_t depth : 10;              // 74
+      uint32_t mip_max_level : 4;       // 78
+      xenos::TextureFormat format : 6;  // 84
+      xenos::Endian endianness : 2;     // 86
+      // Whether this texture is signed and has a different host representation
+      // than an unsigned view of the same guest texture.
+      uint32_t signed_separate : 1;  // 87
+      // Whether this texture is a 2x-scaled resolve target.
+      uint32_t scaled_resolve : 1;  // 88
+    };
+    struct {
+      // The key used for unordered_multimap lookup. Single uint32_t instead of
+      // a uint64_t so XXH hash can be calculated in a stable way due to no
+      // padding.
+      uint32_t map_key[2];
+      // The key used to identify one texture within unordered_multimap buckets.
+      uint32_t bucket_key;
+    };
+    TextureKey() { MakeInvalid(); }
+    TextureKey(const TextureKey& key) {
+      SetMapKey(key.GetMapKey());
+      bucket_key = key.bucket_key;
+    }
+    TextureKey& operator=(const TextureKey& key) {
+      SetMapKey(key.GetMapKey());
+      bucket_key = key.bucket_key;
+      return *this;
+    }
+    bool operator==(const TextureKey& key) const {
+      return GetMapKey() == key.GetMapKey() && bucket_key == key.bucket_key;
+    }
+    bool operator!=(const TextureKey& key) const {
+      return GetMapKey() != key.GetMapKey() || bucket_key != key.bucket_key;
+    }
+    inline uint64_t GetMapKey() const {
+      return uint64_t(map_key[0]) | (uint64_t(map_key[1]) << 32);
+    }
+    inline void SetMapKey(uint64_t key) {
+      map_key[0] = uint32_t(key);
+      map_key[1] = uint32_t(key >> 32);
+    }
+    inline bool IsInvalid() const {
+      // Zero base and zero width is enough for a binding to be invalid.
+      return map_key[0] == 0;
+    }
+    inline void MakeInvalid() {
+      // Reset all for a stable hash.
+      SetMapKey(0);
+      bucket_key = 0;
+    }
+  };
+
  public:
+  // Keys that can be stored for checking validity whether descriptors for host
+  // shader bindings are up to date.
+  struct TextureSRVKey {
+    TextureKey key;
+    uint32_t host_swizzle;
+    uint8_t swizzled_signs;
+  };
+
   // Sampler parameters that can be directly converted to a host sampler or used
-  // for binding hashing.
+  // for binding checking validity whether samplers are up to date.
   union SamplerParameters {
     struct {
-      ClampMode clamp_x : 3;         // 3
-      ClampMode clamp_y : 3;         // 6
-      ClampMode clamp_z : 3;         // 9
-      BorderColor border_color : 2;  // 11
+      xenos::ClampMode clamp_x : 3;         // 3
+      xenos::ClampMode clamp_y : 3;         // 6
+      xenos::ClampMode clamp_z : 3;         // 9
+      xenos::BorderColor border_color : 2;  // 11
       // For anisotropic, these are true.
-      uint32_t mag_linear : 1;       // 12
-      uint32_t min_linear : 1;       // 13
-      uint32_t mip_linear : 1;       // 14
-      AnisoFilter aniso_filter : 3;  // 17
-      uint32_t mip_min_level : 4;    // 21
-      uint32_t mip_max_level : 4;    // 25
-
-      int32_t lod_bias : 10;  // 42
+      uint32_t mag_linear : 1;              // 12
+      uint32_t min_linear : 1;              // 13
+      uint32_t mip_linear : 1;              // 14
+      xenos::AnisoFilter aniso_filter : 3;  // 17
+      uint32_t mip_min_level : 4;           // 21
+      // Maximum mip level is in the texture resource itself.
     };
-    uint64_t value;
+    uint32_t value;
 
     // Clearing the unused bits.
     SamplerParameters() : value(0) {}
@@ -93,7 +168,8 @@ class TextureCache {
   };
 
   TextureCache(D3D12CommandProcessor* command_processor,
-               RegisterFile* register_file, SharedMemory* shared_memory);
+               RegisterFile* register_file, bool bindless_resources_used,
+               SharedMemory* shared_memory);
   ~TextureCache();
 
   bool Initialize(bool edram_rov_used);
@@ -111,14 +187,33 @@ class TextureCache {
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask);
 
-  // Returns the hash of the current bindings (must be called after
-  // RequestTextures) for the provided SRV descriptor layout.
-  uint64_t GetDescriptorHashForActiveTextures(
-      const D3D12Shader::TextureSRV* texture_srvs,
-      uint32_t texture_srv_count) const;
+  // "ActiveTexture" means as of the latest RequestTextures call.
 
-  void WriteTextureSRV(const D3D12Shader::TextureSRV& texture_srv,
-                       D3D12_CPU_DESCRIPTOR_HANDLE handle);
+  // Returns whether texture SRV keys stored externally are still valid for the
+  // current bindings and host shader binding layout. Both keys and
+  // host_shader_bindings must have host_shader_binding_count elements
+  // (otherwise they are incompatible - like if this function returned false).
+  bool AreActiveTextureSRVKeysUpToDate(
+      const TextureSRVKey* keys,
+      const D3D12Shader::TextureBinding* host_shader_bindings,
+      uint32_t host_shader_binding_count) const;
+  // Exports the current binding data to texture SRV keys so they can be stored
+  // for checking whether subsequent draw calls can keep using the same
+  // bindings. Write host_shader_binding_count keys.
+  void WriteActiveTextureSRVKeys(
+      TextureSRVKey* keys,
+      const D3D12Shader::TextureBinding* host_shader_bindings,
+      uint32_t host_shader_binding_count) const;
+  // Returns the post-swizzle signedness of a currently bound texture (must be
+  // called after RequestTextures).
+  uint8_t GetActiveTextureSwizzledSigns(uint32_t index) const {
+    return texture_bindings_[index].swizzled_signs;
+  }
+  void WriteActiveTextureBindfulSRV(
+      const D3D12Shader::TextureBinding& host_shader_binding,
+      D3D12_CPU_DESCRIPTOR_HANDLE handle);
+  uint32_t GetActiveTextureBindlessSRVIndex(
+      const D3D12Shader::TextureBinding& host_shader_binding);
 
   SamplerParameters GetSamplerParameters(
       const D3D12Shader::SamplerBinding& binding) const;
@@ -126,15 +221,15 @@ class TextureCache {
                     D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
-  static inline DXGI_FORMAT GetResolveDXGIFormat(TextureFormat format) {
+  static inline DXGI_FORMAT GetResolveDXGIFormat(xenos::TextureFormat format) {
     return host_formats_[uint32_t(format)].dxgi_format_resolve_tile;
   }
   // The source buffer must be in the non-pixel-shader SRV state.
-  bool TileResolvedTexture(TextureFormat format, uint32_t texture_base,
+  bool TileResolvedTexture(xenos::TextureFormat format, uint32_t texture_base,
                            uint32_t texture_pitch, uint32_t texture_height,
                            bool is_3d, uint32_t offset_x, uint32_t offset_y,
                            uint32_t offset_z, uint32_t resolve_width,
-                           uint32_t resolve_height, Endian128 endian,
+                           uint32_t resolve_height, xenos::Endian128 endian,
                            ID3D12Resource* buffer, uint32_t buffer_size,
                            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
                            uint32_t* written_address_out,
@@ -152,9 +247,6 @@ class TextureCache {
   void UseScaledResolveBufferForReading();
   void UseScaledResolveBufferForWriting();
   // Can't address more than 512 MB on Nvidia, so an offset is required.
-  void CreateScaledResolveBufferRawSRV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                       uint32_t first_unscaled_4kb_page,
-                                       uint32_t unscaled_4kb_page_count);
   void CreateScaledResolveBufferRawUAV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                        uint32_t first_unscaled_4kb_page,
                                        uint32_t unscaled_4kb_page_count);
@@ -164,7 +256,8 @@ class TextureCache {
   // description of its SRV. May call LoadTextureData, so the same restrictions
   // (such as about descriptor heap change possibility) apply.
   ID3D12Resource* RequestSwapTexture(
-      D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out, TextureFormat& format_out);
+      D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
+      xenos::TextureFormat& format_out);
 
  private:
   enum class LoadMode {
@@ -173,10 +266,14 @@ class TextureCache {
     k32bpb,
     k64bpb,
     k128bpb,
-    kR11G11B10ToRGBA16,
-    kR11G11B10ToRGBA16SNorm,
+    kR5G5B5A1ToB5G5R5A1,
+    kR5G6B5ToB5G6R5,
+    kR5G5B6ToB5G6R5WithRBGASwizzle,
+    kR4G4B4A4ToB4G4R4A4,
     kR10G11B11ToRGBA16,
     kR10G11B11ToRGBA16SNorm,
+    kR11G11B10ToRGBA16,
+    kR11G11B10ToRGBA16SNorm,
     kDXT1ToRGBA8,
     kDXT3ToRGBA8,
     kDXT5ToRGBA8,
@@ -196,9 +293,16 @@ class TextureCache {
   struct LoadModeInfo {
     const void* shader;
     size_t shader_size;
+    // Log2 of the sizes, in bytes, of the source (guest) SRV and the
+    // destination (host) UAV accessed by the copying shader, since the shader
+    // may copy multiple blocks per one invocation.
+    uint32_t srv_bpe_log2;
+    uint32_t uav_bpe_log2;
     // Optional shader for loading 2x-scaled resolve targets.
     const void* shader_2x;
     size_t shader_2x_size;
+    uint32_t srv_bpe_log2_2x;
+    uint32_t uav_bpe_log2_2x;
   };
 
   // Tiling modes for storing textures after resolving - needed only for the
@@ -254,6 +358,9 @@ class TextureCache {
     // though), add a constant buffer containing multipliers for the
     // textures and multiplication to the tfetch implementation.
 
+    // Whether the DXGI format, if not uncompressing the texture, consists of
+    // blocks, thus copy regions must be aligned to block size.
+    bool dxgi_format_block_aligned;
     // Uncompression info for when the regular host format for this texture is
     // block-compressed, but the size is not block-aligned, and thus such
     // texture cannot be created in Direct3D on PC and needs decompression,
@@ -271,73 +378,6 @@ class TextureCache {
 
     // Mapping of Xenos swizzle components to DXGI format components.
     uint8_t swizzle[4];
-  };
-
-  union TextureKey {
-    struct {
-      // Physical 4 KB page with the base mip level, disregarding A/C/E address
-      // range prefix.
-      uint32_t base_page : 17;  // 17 total
-      Dimension dimension : 2;  // 19
-      uint32_t width : 13;      // 32
-
-      uint32_t height : 13;      // 45
-      uint32_t tiled : 1;        // 46
-      uint32_t packed_mips : 1;  // 47
-      // Physical 4 KB page with mip 1 and smaller.
-      uint32_t mip_page : 17;  // 64
-
-      // Layers for stacked and 3D, 6 for cube, 1 for other dimensions.
-      uint32_t depth : 10;         // 74
-      uint32_t mip_max_level : 4;  // 78
-      TextureFormat format : 6;    // 84
-      Endian endianness : 2;       // 86
-      // Whether this texture is signed and has a different host representation
-      // than an unsigned view of the same guest texture.
-      uint32_t signed_separate : 1;  // 87
-      // Whether this texture is a 2x-scaled resolve target.
-      uint32_t scaled_resolve : 1;  // 88
-    };
-    struct {
-      // The key used for unordered_multimap lookup. Single uint32_t instead of
-      // a uint64_t so XXH hash can be calculated in a stable way due to no
-      // padding.
-      uint32_t map_key[2];
-      // The key used to identify one texture within unordered_multimap buckets.
-      uint32_t bucket_key;
-    };
-    TextureKey() { MakeInvalid(); }
-    TextureKey(const TextureKey& key) {
-      SetMapKey(key.GetMapKey());
-      bucket_key = key.bucket_key;
-    }
-    TextureKey& operator=(const TextureKey& key) {
-      SetMapKey(key.GetMapKey());
-      bucket_key = key.bucket_key;
-      return *this;
-    }
-    bool operator==(const TextureKey& key) const {
-      return GetMapKey() == key.GetMapKey() && bucket_key == key.bucket_key;
-    }
-    bool operator!=(const TextureKey& key) const {
-      return GetMapKey() != key.GetMapKey() || bucket_key != key.bucket_key;
-    }
-    inline uint64_t GetMapKey() const {
-      return uint64_t(map_key[0]) | (uint64_t(map_key[1]) << 32);
-    }
-    inline void SetMapKey(uint64_t key) {
-      map_key[0] = uint32_t(key);
-      map_key[1] = uint32_t(key >> 32);
-    }
-    inline bool IsInvalid() const {
-      // Zero base and zero width is enough for a binding to be invalid.
-      return map_key[0] == 0;
-    }
-    inline void MakeInvalid() {
-      // Reset all for a stable hash.
-      SetMapKey(0);
-      bucket_key = 0;
-    }
   };
 
   struct Texture {
@@ -364,13 +404,11 @@ class TextureCache {
     // Row pitches on each mip level (for linear layout mainly).
     uint32_t pitches[14];
 
-    // SRV descriptor from the cache, for the first swizzle the texture was used
-    // with (which is usually determined by the format, such as RGBA or BGRA).
-    // If swizzle is kCachedSRVDescriptorSwizzleMissing, the cached descriptor
-    // doesn't exist yet (there are no invalid D3D descriptor handle values).
-    D3D12_CPU_DESCRIPTOR_HANDLE cached_srv_descriptor;
-    static constexpr uint32_t kCachedSRVDescriptorSwizzleMissing = UINT32_MAX;
-    uint32_t cached_srv_descriptor_swizzle;
+    // For bindful - indices in the non-shader-visible descriptor cache for
+    // copying to the shader-visible heap (much faster than recreating, which,
+    // according to profiling, was often a bottleneck in many games).
+    // For bindless - indices in the global shader-visible descriptor heap.
+    std::unordered_map<uint32_t, uint32_t> srv_descriptors;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -387,34 +425,26 @@ class TextureCache {
     static constexpr uint32_t kHeapSize = 65536;
     ID3D12DescriptorHeap* heap;
     D3D12_CPU_DESCRIPTOR_HANDLE heap_start;
-    uint32_t current_usage;
   };
 
   struct LoadConstants {
     // vec4 0.
+    // Base offset in bytes.
     uint32_t guest_base;
     // For linear textures - row byte pitch.
     uint32_t guest_pitch;
-    uint32_t host_base;
-    uint32_t host_pitch;
+    // In blocks - and for mipmaps, it's also power-of-two-aligned.
+    uint32_t guest_storage_width_height[2];
 
     // vec4 1.
-    uint32_t size_texels[3];
-    uint32_t is_3d;
+    uint32_t size_blocks[3];
+    uint32_t is_3d_endian;
 
     // vec4 2.
-    uint32_t size_blocks[3];
-    uint32_t endianness;
-
-    // vec4 3.
-    // Block-aligned and, for mipmaps, power-of-two-aligned width and height.
-    uint32_t guest_storage_width_height[2];
-    uint32_t guest_format;
-    uint32_t padding_3;
-
-    // vec4 4.
-    // Offset within the packed mip for small mips.
-    uint32_t guest_mip_offset[3];
+    // Base offset in bytes.
+    uint32_t host_base;
+    uint32_t host_pitch;
+    uint32_t height_texels;
 
     static constexpr uint32_t kGuestPitchTiled = UINT32_MAX;
   };
@@ -446,31 +476,39 @@ class TextureCache {
 
   struct TextureBinding {
     TextureKey key;
-    uint32_t swizzle;
-    // Whether the fetch has unsigned/biased/gamma components.
-    bool has_unsigned;
-    // Whether the fetch has signed components.
-    bool has_signed;
+    // Destination swizzle merged with guest->host format swizzle.
+    uint32_t host_swizzle;
+    // Packed TextureSign values, 2 bit per each component, with guest-side
+    // destination swizzle from the fetch constant applied to them.
+    uint8_t swizzled_signs;
     // Unsigned version of the texture (or signed if they have the same data).
     Texture* texture;
     // Signed version of the texture if the data in the signed version is
     // different on the host.
     Texture* texture_signed;
+    // Descriptor indices of texture and texture_signed returned from
+    // FindOrCreateTextureDescriptor.
+    uint32_t descriptor_index;
+    uint32_t descriptor_index_signed;
+    void Clear() {
+      std::memset(this, 0, sizeof(*this));
+      descriptor_index = descriptor_index_signed = UINT32_MAX;
+    }
   };
 
   // Whether the signed version of the texture has a different representation on
   // the host than its unsigned version (for example, if it's a fixed-point
   // texture emulated with a larger host pixel format).
-  static inline bool IsSignedVersionSeparate(TextureFormat format) {
+  static inline bool IsSignedVersionSeparate(xenos::TextureFormat format) {
     const HostFormat& host_format = host_formats_[uint32_t(format)];
     return host_format.load_mode_snorm != LoadMode::kUnknown &&
            host_format.load_mode_snorm != host_format.load_mode;
   }
   // Whether decompression is needed on the host (Direct3D only allows creation
   // of block-compressed textures with 4x4-aligned dimensions on PC).
-  static bool IsDecompressionNeeded(TextureFormat format, uint32_t width,
+  static bool IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
                                     uint32_t height);
-  static inline DXGI_FORMAT GetDXGIResourceFormat(TextureFormat format,
+  static inline DXGI_FORMAT GetDXGIResourceFormat(xenos::TextureFormat format,
                                                   uint32_t width,
                                                   uint32_t height) {
     const HostFormat& host_format = host_formats_[uint32_t(format)];
@@ -481,7 +519,7 @@ class TextureCache {
   static inline DXGI_FORMAT GetDXGIResourceFormat(TextureKey key) {
     return GetDXGIResourceFormat(key.format, key.width, key.height);
   }
-  static inline DXGI_FORMAT GetDXGIUnormFormat(TextureFormat format,
+  static inline DXGI_FORMAT GetDXGIUnormFormat(xenos::TextureFormat format,
                                                uint32_t width,
                                                uint32_t height) {
     const HostFormat& host_format = host_formats_[uint32_t(format)];
@@ -497,10 +535,27 @@ class TextureCache {
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
-  // swizzle and used signedness.
+  // host swizzle and post-guest-swizzle signedness.
   static void BindingInfoFromFetchConstant(
       const xenos::xe_gpu_texture_fetch_t& fetch, TextureKey& key_out,
-      uint32_t* swizzle_out, bool* has_unsigned_out, bool* has_signed_out);
+      uint32_t* host_swizzle_out, uint8_t* swizzled_signs_out);
+
+  static constexpr bool AreDimensionsCompatible(
+      xenos::FetchOpDimension binding_dimension,
+      xenos::DataDimension resource_dimension) {
+    switch (binding_dimension) {
+      case xenos::FetchOpDimension::k1D:
+      case xenos::FetchOpDimension::k2D:
+        return resource_dimension == xenos::DataDimension::k1D ||
+               resource_dimension == xenos::DataDimension::k2DOrStacked;
+      case xenos::FetchOpDimension::k3DOrStacked:
+        return resource_dimension == xenos::DataDimension::k3D;
+      case xenos::FetchOpDimension::kCube:
+        return resource_dimension == xenos::DataDimension::kCube;
+      default:
+        return false;
+    }
+  }
 
   static void LogTextureKeyAction(TextureKey key, const char* action);
   static void LogTextureAction(const Texture* texture, const char* action);
@@ -513,6 +568,14 @@ class TextureCache {
   // Writes data from the shared memory to the texture. This binds pipelines,
   // allocates descriptors and copies!
   bool LoadTextureData(Texture* texture);
+
+  // Returns the index of an existing of a newly created non-shader-visible
+  // cached (for bindful) or a shader-visible global (for bindless) descriptor,
+  // or UINT32_MAX if failed to create.
+  uint32_t FindOrCreateTextureDescriptor(Texture& texture, bool is_signed,
+                                         uint32_t host_swizzle);
+  D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(
+      uint32_t descriptor_index) const;
 
   // For LRU caching - updates the last usage frame and moves the texture to
   // the end of the usage queue. Must be called any time the texture is
@@ -549,6 +612,7 @@ class TextureCache {
 
   D3D12CommandProcessor* command_processor_;
   RegisterFile* register_file_;
+  bool bindless_resources_used_;
   SharedMemory* shared_memory_;
 
   static const LoadModeInfo load_mode_info_[];
@@ -568,8 +632,9 @@ class TextureCache {
   uint64_t texture_current_usage_time_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
-  // Cached descriptors used by deleted textures, for reuse.
-  std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> srv_descriptor_cache_free_;
+  uint32_t srv_descriptor_cache_allocated_;
+  // Indices of cached descriptors used by deleted textures, for reuse.
+  std::vector<uint32_t> srv_descriptor_cache_free_;
 
   enum class NullSRVDescriptorIndex {
     k2DArray,
@@ -584,9 +649,9 @@ class TextureCache {
   D3D12_CPU_DESCRIPTOR_HANDLE null_srv_descriptor_heap_start_;
 
   TextureBinding texture_bindings_[32] = {};
-  // Bit vector with bits reset on fetch constant writes to avoid getting
-  // texture keys from the fetch constants again and again.
-  uint32_t texture_keys_in_sync_ = 0;
+  // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
+  // constants again and again.
+  uint32_t texture_bindings_in_sync_ = 0;
 
   // Whether a texture has been invalidated (a watch has been triggered), so
   // need to try to reload textures, disregarding whether fetch constants have

@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "xenia/base/hash.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
@@ -37,9 +38,11 @@ class D3D12CommandProcessor;
 
 class PipelineCache {
  public:
+  static constexpr size_t kLayoutUIDEmpty = 0;
+
   PipelineCache(D3D12CommandProcessor* command_processor,
-                RegisterFile* register_file, bool edram_rov_used,
-                uint32_t resolution_scale);
+                RegisterFile* register_file, bool bindless_resources_used,
+                bool edram_rov_used, uint32_t resolution_scale);
   ~PipelineCache();
 
   bool Initialize();
@@ -53,7 +56,7 @@ class PipelineCache {
   void EndSubmission();
   bool IsCreatingPipelineStates();
 
-  D3D12Shader* LoadShader(ShaderType shader_type, uint32_t guest_address,
+  D3D12Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                           const uint32_t* host_address, uint32_t dword_count);
 
   // Returns the host vertex shader type for the current draw if it's valid and
@@ -67,7 +70,8 @@ class PipelineCache {
 
   bool ConfigurePipeline(
       D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
-      PrimitiveType primitive_type, IndexFormat index_format, bool early_z,
+      xenos::PrimitiveType primitive_type, xenos::IndexFormat index_format,
+      bool early_z,
       const RenderTargetCache::PipelineRenderTarget render_targets[5],
       void** pipeline_state_handle_out,
       ID3D12RootSignature** root_signature_out);
@@ -84,7 +88,7 @@ class PipelineCache {
     uint64_t ucode_data_hash;
 
     uint32_t ucode_dword_count : 16;
-    ShaderType type : 1;
+    xenos::ShaderType type : 1;
     Shader::HostVertexShaderType host_vertex_shader_type : 3;
 
     reg::SQ_PROGRAM_CNTL sq_program_cntl;
@@ -152,15 +156,15 @@ class PipelineCache {
 
   // Update PipelineDescription::kVersion if anything is changed!
   XEPACKEDSTRUCT(PipelineRenderTarget, {
-    uint32_t used : 1;                         // 1
-    ColorRenderTargetFormat format : 4;        // 5
-    PipelineBlendFactor src_blend : 4;         // 9
-    PipelineBlendFactor dest_blend : 4;        // 13
-    BlendOp blend_op : 3;                      // 16
-    PipelineBlendFactor src_blend_alpha : 4;   // 20
-    PipelineBlendFactor dest_blend_alpha : 4;  // 24
-    BlendOp blend_op_alpha : 3;                // 27
-    uint32_t write_mask : 4;                   // 31
+    uint32_t used : 1;                          // 1
+    xenos::ColorRenderTargetFormat format : 4;  // 5
+    PipelineBlendFactor src_blend : 4;          // 9
+    PipelineBlendFactor dest_blend : 4;         // 13
+    xenos::BlendOp blend_op : 3;                // 16
+    PipelineBlendFactor src_blend_alpha : 4;    // 20
+    PipelineBlendFactor dest_blend_alpha : 4;   // 24
+    xenos::BlendOp blend_op_alpha : 3;          // 27
+    uint32_t write_mask : 4;                    // 31
   });
 
   XEPACKEDSTRUCT(PipelineDescription, {
@@ -177,28 +181,28 @@ class PipelineCache {
     // xenos::TessellationMode for a domain shader.
     uint32_t primitive_topology_type_or_tessellation_mode : 2;  // 7
     // Zero for non-kVertex host_vertex_shader_type.
-    PipelineGeometryShader geometry_shader : 2;  // 9
-    uint32_t fill_mode_wireframe : 1;            // 10
-    PipelineCullMode cull_mode : 2;              // 12
-    uint32_t front_counter_clockwise : 1;        // 13
-    uint32_t depth_clip : 1;                     // 14
-    uint32_t rov_msaa : 1;                       // 15
-    DepthRenderTargetFormat depth_format : 1;    // 16
-    CompareFunction depth_func : 3;              // 19
-    uint32_t depth_write : 1;                    // 20
-    uint32_t stencil_enable : 1;                 // 21
-    uint32_t stencil_read_mask : 8;              // 29
-    uint32_t force_early_z : 1;                  // 30
+    PipelineGeometryShader geometry_shader : 2;       // 9
+    uint32_t fill_mode_wireframe : 1;                 // 10
+    PipelineCullMode cull_mode : 2;                   // 12
+    uint32_t front_counter_clockwise : 1;             // 13
+    uint32_t depth_clip : 1;                          // 14
+    uint32_t rov_msaa : 1;                            // 15
+    xenos::DepthRenderTargetFormat depth_format : 1;  // 16
+    xenos::CompareFunction depth_func : 3;            // 19
+    uint32_t depth_write : 1;                         // 20
+    uint32_t stencil_enable : 1;                      // 21
+    uint32_t stencil_read_mask : 8;                   // 29
+    uint32_t force_early_z : 1;                       // 30
 
-    uint32_t stencil_write_mask : 8;            // 8
-    StencilOp stencil_front_fail_op : 3;        // 11
-    StencilOp stencil_front_depth_fail_op : 3;  // 14
-    StencilOp stencil_front_pass_op : 3;        // 17
-    CompareFunction stencil_front_func : 3;     // 20
-    StencilOp stencil_back_fail_op : 3;         // 23
-    StencilOp stencil_back_depth_fail_op : 3;   // 26
-    StencilOp stencil_back_pass_op : 3;         // 29
-    CompareFunction stencil_back_func : 3;      // 32
+    uint32_t stencil_write_mask : 8;                   // 8
+    xenos::StencilOp stencil_front_fail_op : 3;        // 11
+    xenos::StencilOp stencil_front_depth_fail_op : 3;  // 14
+    xenos::StencilOp stencil_front_pass_op : 3;        // 17
+    xenos::CompareFunction stencil_front_func : 3;     // 20
+    xenos::StencilOp stencil_back_fail_op : 3;         // 23
+    xenos::StencilOp stencil_back_depth_fail_op : 3;   // 26
+    xenos::StencilOp stencil_back_pass_op : 3;         // 29
+    xenos::CompareFunction stencil_back_func : 3;      // 32
 
     PipelineRenderTarget render_targets[4];
 
@@ -217,6 +221,7 @@ class PipelineCache {
     PipelineDescription description;
   };
 
+  // Can be called from multiple threads.
   bool TranslateShader(DxbcShaderTranslator& translator, D3D12Shader* shader,
                        reg::SQ_PROGRAM_CNTL cntl,
                        Shader::HostVertexShaderType host_vertex_shader_type =
@@ -224,7 +229,8 @@ class PipelineCache {
 
   bool GetCurrentStateDescription(
       D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
-      PrimitiveType primitive_type, IndexFormat index_format, bool early_z,
+      xenos::PrimitiveType primitive_type, xenos::IndexFormat index_format,
+      bool early_z,
       const RenderTargetCache::PipelineRenderTarget render_targets[5],
       PipelineRuntimeDescription& runtime_description_out);
 
@@ -233,13 +239,37 @@ class PipelineCache {
 
   D3D12CommandProcessor* command_processor_;
   RegisterFile* register_file_;
+  bool bindless_resources_used_;
   bool edram_rov_used_;
   uint32_t resolution_scale_;
 
   // Reusable shader translator.
   std::unique_ptr<DxbcShaderTranslator> shader_translator_ = nullptr;
   // All loaded shaders mapped by their guest hash key.
-  std::unordered_map<uint64_t, D3D12Shader*> shader_map_;
+  std::unordered_map<uint64_t, D3D12Shader*, xe::hash::IdentityHasher<uint64_t>>
+      shader_map_;
+
+  struct LayoutUID {
+    size_t uid;
+    size_t vector_span_offset;
+    size_t vector_span_length;
+  };
+  std::mutex layouts_mutex_;
+  // Texture binding layouts of different shaders, for obtaining layout UIDs.
+  std::vector<D3D12Shader::TextureBinding> texture_binding_layouts_;
+  // Map of texture binding layouts used by shaders, for obtaining UIDs. Keys
+  // are XXH64 hashes of layouts, values need manual collision resolution using
+  // layout_vector_offset:layout_length of texture_binding_layouts_.
+  std::unordered_multimap<uint64_t, LayoutUID,
+                          xe::hash::IdentityHasher<uint64_t>>
+      texture_binding_layout_map_;
+  // Bindless sampler indices of different shaders, for obtaining layout UIDs.
+  // For bindful, sampler count is used as the UID instead.
+  std::vector<uint32_t> bindless_sampler_layouts_;
+  // Keys are XXH64 hashes of used bindless sampler indices.
+  std::unordered_multimap<uint64_t, LayoutUID,
+                          xe::hash::IdentityHasher<uint64_t>>
+      bindless_sampler_layout_map_;
 
   // Empty depth-only pixel shader for writing to depth buffer via ROV when no
   // Xenos pixel shader provided.
@@ -252,7 +282,9 @@ class PipelineCache {
   };
   // All previously generated pipeline state objects identified by hash and the
   // description.
-  std::unordered_multimap<uint64_t, PipelineState*> pipeline_states_;
+  std::unordered_multimap<uint64_t, PipelineState*,
+                          xe::hash::IdentityHasher<uint64_t>>
+      pipeline_states_;
 
   // Previously used pipeline state object. This matches our current state
   // settings and allows us to quickly(ish) reuse the pipeline state if no

@@ -63,11 +63,6 @@ namespace d3d12 {
 #include "xenia/gpu/d3d12/shaders/dxbc/resolve_ps.h"
 #include "xenia/gpu/d3d12/shaders/dxbc/resolve_vs.h"
 
-#if 0
-constexpr uint32_t RenderTargetCache::kHeap4MBPages;
-#endif
-constexpr uint32_t RenderTargetCache::kRenderTargetDescriptorHeapSize;
-
 const RenderTargetCache::EDRAMLoadStoreModeInfo
     RenderTargetCache::edram_load_store_mode_info_[size_t(
         RenderTargetCache::EDRAMLoadStoreMode::kCount)] = {
@@ -102,10 +97,12 @@ const RenderTargetCache::EDRAMLoadStoreModeInfo
 RenderTargetCache::RenderTargetCache(D3D12CommandProcessor* command_processor,
                                      RegisterFile* register_file,
                                      TraceWriter* trace_writer,
+                                     bool bindless_resources_used,
                                      bool edram_rov_used)
     : command_processor_(command_processor),
       register_file_(register_file),
       trace_writer_(trace_writer),
+      bindless_resources_used_(bindless_resources_used),
       edram_rov_used_(edram_rov_used) {}
 
 RenderTargetCache::~RenderTargetCache() { Shutdown(); }
@@ -156,13 +153,13 @@ bool RenderTargetCache::Initialize(const TextureCache* texture_cache) {
   }
   edram_buffer_descriptor_heap_start_ =
       edram_buffer_descriptor_heap_->GetCPUDescriptorHandleForHeapStart();
-  ui::d3d12::util::CreateRawBufferSRV(
+  ui::d3d12::util::CreateBufferRawSRV(
       device,
       provider->OffsetViewDescriptor(
           edram_buffer_descriptor_heap_start_,
           uint32_t(EDRAMBufferDescriptorIndex::kRawSRV)),
       edram_buffer_, GetEDRAMBufferSize());
-  ui::d3d12::util::CreateRawBufferUAV(
+  ui::d3d12::util::CreateBufferRawUAV(
       device,
       provider->OffsetViewDescriptor(
           edram_buffer_descriptor_heap_start_,
@@ -181,10 +178,10 @@ bool RenderTargetCache::Initialize(const TextureCache* texture_cache) {
       edram_buffer_, nullptr, &edram_buffer_uint32_uav_desc,
       provider->OffsetViewDescriptor(
           edram_buffer_descriptor_heap_start_,
-          uint32_t(EDRAMBufferDescriptorIndex::kUint32UAV)));
+          uint32_t(EDRAMBufferDescriptorIndex::kR32UintUAV)));
 
   // Create the root signature for EDRAM buffer load/store.
-  D3D12_ROOT_PARAMETER load_store_root_parameters[2];
+  D3D12_ROOT_PARAMETER load_store_root_parameters[3];
   // Parameter 0 is constants (changed for each render target binding).
   load_store_root_parameters[0].ParameterType =
       D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -193,24 +190,32 @@ bool RenderTargetCache::Initialize(const TextureCache* texture_cache) {
   load_store_root_parameters[0].Constants.Num32BitValues =
       sizeof(EDRAMLoadStoreRootConstants) / sizeof(uint32_t);
   load_store_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-  // Parameter 1 is source and target.
-  D3D12_DESCRIPTOR_RANGE load_store_root_ranges[2];
-  load_store_root_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  load_store_root_ranges[0].NumDescriptors = 1;
-  load_store_root_ranges[0].BaseShaderRegister = 0;
-  load_store_root_ranges[0].RegisterSpace = 0;
-  load_store_root_ranges[0].OffsetInDescriptorsFromTableStart = 0;
-  load_store_root_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-  load_store_root_ranges[1].NumDescriptors = 1;
-  load_store_root_ranges[1].BaseShaderRegister = 0;
-  load_store_root_ranges[1].RegisterSpace = 0;
-  load_store_root_ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  // Parameter 1 is the destination.
+  D3D12_DESCRIPTOR_RANGE load_store_root_dest_range;
+  load_store_root_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  load_store_root_dest_range.NumDescriptors = 1;
+  load_store_root_dest_range.BaseShaderRegister = 0;
+  load_store_root_dest_range.RegisterSpace = 0;
+  load_store_root_dest_range.OffsetInDescriptorsFromTableStart = 0;
   load_store_root_parameters[1].ParameterType =
       D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  load_store_root_parameters[1].DescriptorTable.NumDescriptorRanges = 2;
+  load_store_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
   load_store_root_parameters[1].DescriptorTable.pDescriptorRanges =
-      load_store_root_ranges;
+      &load_store_root_dest_range;
   load_store_root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  // Parameter 2 is the source.
+  D3D12_DESCRIPTOR_RANGE load_store_root_source_range;
+  load_store_root_source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  load_store_root_source_range.NumDescriptors = 1;
+  load_store_root_source_range.BaseShaderRegister = 0;
+  load_store_root_source_range.RegisterSpace = 0;
+  load_store_root_source_range.OffsetInDescriptorsFromTableStart = 0;
+  load_store_root_parameters[2].ParameterType =
+      D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  load_store_root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+  load_store_root_parameters[2].DescriptorTable.pDescriptorRanges =
+      &load_store_root_source_range;
+  load_store_root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC load_store_root_desc;
   load_store_root_desc.NumParameters =
       UINT(xe::countof(load_store_root_parameters));
@@ -226,10 +231,8 @@ bool RenderTargetCache::Initialize(const TextureCache* texture_cache) {
     Shutdown();
     return false;
   }
-  // Create the clear root signature (the same, but with the UAV only).
-  load_store_root_ranges[1].OffsetInDescriptorsFromTableStart = 0;
-  load_store_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-  ++load_store_root_parameters[1].DescriptorTable.pDescriptorRanges;
+  // Create the clear root signature (the same, but with the destination only).
+  load_store_root_desc.NumParameters = 2;
   edram_clear_root_signature_ =
       ui::d3d12::util::CreateRootSignature(provider, load_store_root_desc);
   if (edram_clear_root_signature_ == nullptr) {
@@ -571,9 +574,9 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
     return false;
   }
   uint32_t msaa_samples_x =
-      rb_surface_info.msaa_samples >= MsaaSamples::k4X ? 2 : 1;
+      rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
   uint32_t msaa_samples_y =
-      rb_surface_info.msaa_samples >= MsaaSamples::k2X ? 2 : 1;
+      rb_surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
 
   // Extract color/depth info in an unified way.
   bool enabled[5];
@@ -588,7 +591,7 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
     edram_bases[i] = std::min(color_info.color_base, 2048u);
     formats[i] = uint32_t(GetBaseColorFormat(color_info.color_format));
     formats_are_64bpp[i] =
-        IsColorFormat64bpp(ColorRenderTargetFormat(formats[i]));
+        IsColorFormat64bpp(xenos::ColorRenderTargetFormat(formats[i]));
   }
   auto rb_depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
   auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
@@ -960,7 +963,7 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
         render_target->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         current_pipeline_render_targets_[rtv_count].guest_render_target = i;
         current_pipeline_render_targets_[rtv_count].format =
-            GetColorDXGIFormat(ColorRenderTargetFormat(formats[i]));
+            GetColorDXGIFormat(xenos::ColorRenderTargetFormat(formats[i]));
         ++rtv_count;
       }
       for (uint32_t i = rtv_count; i < 4; ++i) {
@@ -977,7 +980,7 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
             D3D12_RESOURCE_STATE_DEPTH_WRITE);
         depth_render_target->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         current_pipeline_render_targets_[4].format =
-            GetDepthDXGIFormat(DepthRenderTargetFormat(formats[4]));
+            GetDepthDXGIFormat(xenos::DepthRenderTargetFormat(formats[4]));
       } else {
         current_pipeline_render_targets_[4].format = DXGI_FORMAT_UNKNOWN;
       }
@@ -1086,7 +1089,7 @@ bool RenderTargetCache::Resolve(SharedMemory* shared_memory,
   const auto& fetch = regs.Get<xenos::xe_gpu_vertex_fetch_t>(
       XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0);
   assert_true(fetch.type == xenos::FetchConstantType::kVertex);
-  assert_true(fetch.endian == Endian::k8in32);
+  assert_true(fetch.endian == xenos::Endian::k8in32);
   assert_true(fetch.size == 6);
   trace_writer_->WriteMemoryRead(fetch.address << 2, fetch.size << 2);
   const uint8_t* src_vertex_address =
@@ -1098,7 +1101,7 @@ bool RenderTargetCache::Resolve(SharedMemory* shared_memory,
   for (uint32_t i = 0; i < 6; ++i) {
     vertices[i] =
         xenos::GpuSwap(xe::load<float>(src_vertex_address + i * sizeof(float)),
-                       Endian(fetch.endian)) +
+                       xenos::Endian(fetch.endian)) +
         vertex_offset;
   }
   // Xenos only supports rectangle copies (luckily).
@@ -1167,7 +1170,7 @@ bool RenderTargetCache::Resolve(SharedMemory* shared_memory,
       "at {}",
       rect.left, rect.top, rect.right, rect.bottom, surface_index,
       surface_pitch, 1 << uint32_t(rb_surface_info.msaa_samples),
-      rb_surface_info.msaa_samples != MsaaSamples::k1X ? "s" : "",
+      rb_surface_info.msaa_samples != xenos::MsaaSamples::k1X ? "s" : "",
       surface_format, surface_edram_base);
 
   if (rect.left >= rect.right || rect.top >= rect.bottom) {
@@ -1203,8 +1206,9 @@ bool RenderTargetCache::Resolve(SharedMemory* shared_memory,
 bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
                                     TextureCache* texture_cache,
                                     uint32_t edram_base, uint32_t surface_pitch,
-                                    MsaaSamples msaa_samples, bool is_depth,
-                                    uint32_t src_format, const D3D12_RECT& rect,
+                                    xenos::MsaaSamples msaa_samples,
+                                    bool is_depth, uint32_t src_format,
+                                    const D3D12_RECT& rect,
                                     uint32_t& written_address_out,
                                     uint32_t& written_length_out) {
   written_address_out = written_length_out = 0;
@@ -1223,35 +1227,35 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
 
   // Get format info.
   auto rb_copy_dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
-  TextureFormat src_texture_format;
+  xenos::TextureFormat src_texture_format;
   bool src_64bpp;
   if (is_depth) {
-    src_texture_format =
-        DepthRenderTargetToTextureFormat(DepthRenderTargetFormat(src_format));
+    src_texture_format = DepthRenderTargetToTextureFormat(
+        xenos::DepthRenderTargetFormat(src_format));
     src_64bpp = false;
   } else {
     // Force k_16_16 and k_16_16_16_16 RTs to be always resolved via drawing,
     // because resolving to a k_16_16 or a k_16_16_16_16 texture should result
     // in unsigned texture data, unlike the render target which is signed.
-    if (ColorRenderTargetFormat(src_format) ==
-        ColorRenderTargetFormat::k_16_16) {
-      src_texture_format = TextureFormat::k_16_16_EDRAM;
-    } else if (ColorRenderTargetFormat(src_format) ==
-               ColorRenderTargetFormat::k_16_16_16_16) {
-      src_texture_format = TextureFormat::k_16_16_16_16_EDRAM;
+    if (xenos::ColorRenderTargetFormat(src_format) ==
+        xenos::ColorRenderTargetFormat::k_16_16) {
+      src_texture_format = xenos::TextureFormat::k_16_16_EDRAM;
+    } else if (xenos::ColorRenderTargetFormat(src_format) ==
+               xenos::ColorRenderTargetFormat::k_16_16_16_16) {
+      src_texture_format = xenos::TextureFormat::k_16_16_16_16_EDRAM;
     } else {
       src_texture_format = GetBaseFormat(ColorRenderTargetToTextureFormat(
-          ColorRenderTargetFormat(src_format)));
+          xenos::ColorRenderTargetFormat(src_format)));
     }
-    src_64bpp = IsColorFormat64bpp(ColorRenderTargetFormat(src_format));
+    src_64bpp = IsColorFormat64bpp(xenos::ColorRenderTargetFormat(src_format));
   }
-  assert_true(src_texture_format != TextureFormat::kUnknown);
+  assert_true(src_texture_format != xenos::TextureFormat::kUnknown);
   // The destination format is specified as k_8_8_8_8 when resolving depth, but
   // no format conversion is done for depth, so ignore it.
-  TextureFormat dest_format =
-      is_depth
-          ? src_texture_format
-          : GetBaseFormat(TextureFormat(rb_copy_dest_info.copy_dest_format));
+  xenos::TextureFormat dest_format =
+      is_depth ? src_texture_format
+               : GetBaseFormat(
+                     xenos::TextureFormat(rb_copy_dest_info.copy_dest_format));
   const FormatInfo* dest_format_info = FormatInfo::Get(dest_format);
 
   // Get the destination region and clamp the source region to it.
@@ -1320,10 +1324,10 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     dest_exp_bias = 0;
   } else {
     dest_exp_bias = rb_copy_dest_info.copy_dest_exp_bias;
-    if (ColorRenderTargetFormat(src_format) ==
-            ColorRenderTargetFormat::k_16_16 ||
-        ColorRenderTargetFormat(src_format) ==
-            ColorRenderTargetFormat::k_16_16_16_16) {
+    if (xenos::ColorRenderTargetFormat(src_format) ==
+            xenos::ColorRenderTargetFormat::k_16_16 ||
+        xenos::ColorRenderTargetFormat(src_format) ==
+            xenos::ColorRenderTargetFormat::k_16_16_16_16) {
       // On the Xbox 360, k_16_16_EDRAM and k_16_16_16_16_EDRAM internally have
       // -32...32 range, but they're emulated using normalized RG16/RGBA16, so
       // sampling the host render target gives 1/32 of what is actually stored
@@ -1359,8 +1363,8 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
   //   bilinear filtering), applying exponent bias and swapping red and blue in
   //   a format-agnostic way, then the resulting color is written to a temporary
   //   RTV of the destination format.
-  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
-  auto device = provider->GetDevice();
+  auto device =
+      command_processor_->GetD3D12Context()->GetD3D12Provider()->GetDevice();
   uint32_t resolution_scale_log2 = resolution_scale_2x_ ? 1 : 0;
   // Check if we need to apply the hack to remove the gap on the left and top
   // sides of the screen caused by half-pixel offset becoming whole pixel offset
@@ -1423,33 +1427,50 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     }
 
     // Write the source and destination descriptors.
-    D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
-    D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
-    if (command_processor_->RequestViewDescriptors(
-            ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid, 2, 2,
-            descriptor_cpu_start, descriptor_gpu_start) ==
-        ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-      return false;
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_dest;
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_source;
+    if (bindless_resources_used_) {
+      if (resolution_scale_2x_) {
+        if (!command_processor_->RequestOneUseSingleViewDescriptors(
+                1, &descriptor_dest)) {
+          return false;
+        }
+      } else {
+        descriptor_dest = command_processor_->GetSystemBindlessViewHandlePair(
+            D3D12CommandProcessor::SystemBindlessView::kSharedMemoryRawUAV);
+      }
+      descriptor_source = command_processor_->GetSystemBindlessViewHandlePair(
+          D3D12CommandProcessor::SystemBindlessView::kEDRAMRawSRV);
+    } else {
+      ui::d3d12::util::DescriptorCPUGPUHandlePair descriptors[2];
+      if (!command_processor_->RequestOneUseSingleViewDescriptors(
+              2, descriptors)) {
+        return false;
+      }
+      descriptor_dest = descriptors[0];
+      if (!resolution_scale_2x_) {
+        shared_memory->WriteRawUAVDescriptor(descriptor_dest.first);
+      }
+      descriptor_source = descriptors[1];
+      WriteEDRAMRawSRVDescriptor(descriptor_source.first);
     }
     TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    WriteEDRAMRawSRVDescriptor(descriptor_cpu_start);
     if (resolution_scale_2x_) {
       texture_cache->UseScaledResolveBufferForWriting();
       // Can't address more than 512 MB directly on Nvidia - binding only a part
       // of the buffer.
       texture_cache->CreateScaledResolveBufferRawUAV(
-          provider->OffsetViewDescriptor(descriptor_cpu_start, 1),
-          dest_address >> 12,
+          descriptor_dest.first, dest_address >> 12,
           ((dest_address + dest_size - 1) >> 12) - (dest_address >> 12) + 1);
     } else {
       shared_memory->UseForWriting();
-      shared_memory->WriteRawUAVDescriptor(
-          provider->OffsetViewDescriptor(descriptor_cpu_start, 1));
+      // Descriptor already written.
     }
-    command_processor_->SubmitBarriers();
 
     // Dispatch the computation.
     command_list->D3DSetComputeRootSignature(edram_load_store_root_signature_);
+    command_list->D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
+    command_list->D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
     EDRAMLoadStoreRootConstants root_constants;
     // Address is adjusted to the first modified tile, so using & 31 as the
     // destination offset.
@@ -1466,7 +1487,7 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
       // of the buffer.
       root_constants.tile_sample_dest_base -= dest_address & ~0xFFFu;
     }
-    assert_true(dest_pitch <= 8192);
+    assert_true(dest_pitch <= xenos::kTexture2DCubeMaxWidthHeight);
     root_constants.tile_sample_dest_info =
         ((dest_pitch + 31) >> 5) |
         (rb_copy_dest_info.copy_dest_array ? (((dest_height + 31) >> 5) << 9)
@@ -1480,23 +1501,24 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
         edram_base | (resolution_scale_log2 << 13) |
         (resolution_scale_edge_clamp ? (1 << 14) : 0) |
         (is_depth ? (1 << 15) : 0) | (surface_pitch_tiles << 16);
-    if (msaa_samples >= MsaaSamples::k2X) {
+    if (msaa_samples >= xenos::MsaaSamples::k2X) {
       root_constants.base_samples_2x_depth_pitch |= 1 << 11;
-      if (msaa_samples >= MsaaSamples::k4X) {
+      if (msaa_samples >= xenos::MsaaSamples::k4X) {
         root_constants.base_samples_2x_depth_pitch |= 1 << 12;
       }
     }
     command_list->D3DSetComputeRoot32BitConstants(
         0, sizeof(root_constants) / sizeof(uint32_t), &root_constants, 0);
-    command_list->D3DSetComputeRootDescriptorTable(1, descriptor_gpu_start);
+
     command_processor_->SetComputePipeline(
         src_64bpp ? edram_tile_sample_64bpp_pipeline_
                   : edram_tile_sample_32bpp_pipeline_);
+    command_processor_->SubmitBarriers();
     // 1 group per destination 80x16 region.
     uint32_t group_count_x = row_width_ss_div_80, group_count_y = rows;
-    if (msaa_samples >= MsaaSamples::k2X) {
+    if (msaa_samples >= xenos::MsaaSamples::k2X) {
       group_count_y = (group_count_y + 1) >> 1;
-      if (msaa_samples >= MsaaSamples::k4X) {
+      if (msaa_samples >= xenos::MsaaSamples::k4X) {
         group_count_x = (group_count_x + 1) >> 1;
       }
     }
@@ -1572,14 +1594,30 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     if (resolve_target == nullptr) {
       return false;
     }
-    // Descriptors. 2 for EDRAM load, 1 for conversion.
-    D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
-    D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
-    if (command_processor_->RequestViewDescriptors(
-            ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid, 3, 3,
-            descriptor_cpu_start, descriptor_gpu_start) ==
-        ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-      return false;
+    // Descriptors.
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_copy_buffer;
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_rt;
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_edram;
+    if (bindless_resources_used_) {
+      ui::d3d12::util::DescriptorCPUGPUHandlePair descriptors[2];
+      if (!command_processor_->RequestOneUseSingleViewDescriptors(
+              2, descriptors)) {
+        return false;
+      }
+      descriptor_copy_buffer = descriptors[0];
+      descriptor_rt = descriptors[1];
+      descriptor_edram = command_processor_->GetSystemBindlessViewHandlePair(
+          D3D12CommandProcessor::SystemBindlessView::kEDRAMRawSRV);
+    } else {
+      ui::d3d12::util::DescriptorCPUGPUHandlePair descriptors[3];
+      if (!command_processor_->RequestOneUseSingleViewDescriptors(
+              3, descriptors)) {
+        return false;
+      }
+      descriptor_copy_buffer = descriptors[0];
+      descriptor_rt = descriptors[1];
+      descriptor_edram = descriptors[2];
+      WriteEDRAMRawSRVDescriptor(descriptor_edram.first);
     }
     // Buffer for copying.
     D3D12_RESOURCE_STATES copy_buffer_state =
@@ -1606,9 +1644,9 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     load_root_constants.base_samples_2x_depth_pitch =
         edram_base | (resolution_scale_log2 << 13) |
         (surface_pitch_tiles << 16);
-    if (msaa_samples >= MsaaSamples::k2X) {
+    if (msaa_samples >= xenos::MsaaSamples::k2X) {
       load_root_constants.base_samples_2x_depth_pitch |= 1 << 11;
-      if (msaa_samples >= MsaaSamples::k4X) {
+      if (msaa_samples >= xenos::MsaaSamples::k4X) {
         load_root_constants.base_samples_2x_depth_pitch |= 1 << 12;
       }
     }
@@ -1616,11 +1654,12 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
         0, sizeof(load_root_constants) / sizeof(uint32_t), &load_root_constants,
         0);
 
-    WriteEDRAMRawSRVDescriptor(descriptor_cpu_start);
-    ui::d3d12::util::CreateRawBufferUAV(
-        device, provider->OffsetViewDescriptor(descriptor_cpu_start, 1),
-        copy_buffer, render_target->copy_buffer_size);
-    command_list->D3DSetComputeRootDescriptorTable(1, descriptor_gpu_start);
+    command_list->D3DSetComputeRootDescriptorTable(2, descriptor_edram.second);
+    ui::d3d12::util::CreateBufferRawUAV(device, descriptor_copy_buffer.first,
+                                        copy_buffer,
+                                        render_target->copy_buffer_size);
+    command_list->D3DSetComputeRootDescriptorTable(
+        1, descriptor_copy_buffer.second);
 
     EDRAMLoadStoreMode mode = GetLoadStoreMode(false, src_format);
     command_processor_->SetComputePipeline(
@@ -1629,13 +1668,6 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     // 1 group per 80x16 samples, with both 1x and 2x resolution scales.
     command_list->D3DDispatch(row_width_ss_div_80, rows, 1);
     command_processor_->PushUAVBarrier(copy_buffer);
-
-    // Go to the next descriptor set.
-
-    descriptor_cpu_start =
-        provider->OffsetViewDescriptor(descriptor_cpu_start, 2);
-    descriptor_gpu_start =
-        provider->OffsetViewDescriptor(descriptor_gpu_start, 2);
 
     // Copy the EDRAM buffer contents to the source texture.
 
@@ -1677,8 +1709,8 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     command_list->D3DSetGraphicsRootSignature(resolve_root_signature_);
 
     ResolveRootConstants resolve_root_constants;
-    uint32_t samples_x_log2 = msaa_samples >= MsaaSamples::k4X ? 1 : 0;
-    uint32_t samples_y_log2 = msaa_samples >= MsaaSamples::k2X ? 1 : 0;
+    uint32_t samples_x_log2 = msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
+    uint32_t samples_y_log2 = msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0;
     resolve_root_constants.rect_samples_lw =
         (copy_rect.left << (samples_x_log2 + resolution_scale_log2)) |
         (copy_width << (16 + samples_x_log2 + resolution_scale_log2));
@@ -1692,10 +1724,10 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
         samples_y_log2 | (samples_x_log2 << 1) |
         (resolution_scale_edge_clamp ? (1 << 6) : 0) |
         ((uint32_t(dest_exp_bias) & 0x3F) << 7);
-    if (msaa_samples == MsaaSamples::k1X) {
+    if (msaa_samples == xenos::MsaaSamples::k1X) {
       // No offset.
       resolve_root_constants.resolve_info |= (1 << 2) | (1 << 4);
-    } else if (msaa_samples == MsaaSamples::k2X) {
+    } else if (msaa_samples == xenos::MsaaSamples::k2X) {
       // -0.5 or +0.5 samples vertical offset if getting only one sample.
       if (sample_select == xenos::CopySampleSelect::k0) {
         resolve_root_constants.resolve_info |= (0 << 2) | (1 << 4);
@@ -1736,26 +1768,26 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
 
     D3D12_SHADER_RESOURCE_VIEW_DESC rt_srv_desc;
     rt_srv_desc.Format =
-        GetColorDXGIFormat(ColorRenderTargetFormat(src_format));
+        GetColorDXGIFormat(xenos::ColorRenderTargetFormat(src_format));
     rt_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     UINT swizzle = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     if (dest_swap) {
-      switch (ColorRenderTargetFormat(src_format)) {
-        case ColorRenderTargetFormat::k_8_8_8_8:
-        case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-        case ColorRenderTargetFormat::k_2_10_10_10:
-        case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case ColorRenderTargetFormat::k_16_16_16_16:
-        case ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-        case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-        case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+      switch (xenos::ColorRenderTargetFormat(src_format)) {
+        case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+        case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+        case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+        case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+        case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
           swizzle = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 3);
           break;
         default:
           break;
       }
     }
-    if (dest_format == TextureFormat::k_6_5_5) {
+    if (dest_format == xenos::TextureFormat::k_6_5_5) {
       // Green bits of the resolve target used for blue, and blue bits used for
       // green.
       swizzle = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
@@ -1770,11 +1802,11 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
     rt_srv_desc.Texture2D.PlaneSlice = 0;
     rt_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
     device->CreateShaderResourceView(render_target->resource, &rt_srv_desc,
-                                     descriptor_cpu_start);
-    command_list->D3DSetGraphicsRootDescriptorTable(1, descriptor_gpu_start);
+                                     descriptor_rt.first);
+    command_list->D3DSetGraphicsRootDescriptorTable(1, descriptor_rt.second);
 
     command_processor_->SubmitBarriers();
-    command_processor_->SetSamplePositions(MsaaSamples::k1X);
+    command_processor_->SetSamplePositions(xenos::MsaaSamples::k1X);
     command_processor_->SetExternalGraphicsPipeline(resolve_pipeline);
     command_list->D3DOMSetRenderTargets(1, &resolve_target->rtv_handle, TRUE,
                                         nullptr);
@@ -1845,8 +1877,9 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
 
 bool RenderTargetCache::ResolveClear(uint32_t edram_base,
                                      uint32_t surface_pitch,
-                                     MsaaSamples msaa_samples, bool is_depth,
-                                     uint32_t format, const D3D12_RECT& rect) {
+                                     xenos::MsaaSamples msaa_samples,
+                                     bool is_depth, uint32_t format,
+                                     const D3D12_RECT& rect) {
   auto& regs = *register_file_;
 
   // Check if clearing is enabled.
@@ -1866,7 +1899,7 @@ bool RenderTargetCache::ResolveClear(uint32_t edram_base,
 
   // Calculate the layout.
   bool is_64bpp =
-      !is_depth && IsColorFormat64bpp(ColorRenderTargetFormat(format));
+      !is_depth && IsColorFormat64bpp(xenos::ColorRenderTargetFormat(format));
   D3D12_RECT clear_rect = rect;
   uint32_t surface_pitch_tiles, row_width_ss_div_80, rows;
   if (!GetEDRAMLayout(surface_pitch, msaa_samples, is_64bpp, edram_base,
@@ -1875,20 +1908,20 @@ bool RenderTargetCache::ResolveClear(uint32_t edram_base,
     // Nothing to clear.
     return true;
   }
-  uint32_t samples_x_log2 = msaa_samples >= MsaaSamples::k4X ? 1 : 0;
-  uint32_t samples_y_log2 = msaa_samples >= MsaaSamples::k2X ? 1 : 0;
+  uint32_t samples_x_log2 = msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
+  uint32_t samples_y_log2 = msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0;
 
-  // Get everything needed for clearing.
-  auto command_list = command_processor_->GetDeferredCommandList();
-  auto device =
-      command_processor_->GetD3D12Context()->GetD3D12Provider()->GetDevice();
-  D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
-  D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
-  if (command_processor_->RequestViewDescriptors(
-          ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid, 1, 1,
-          descriptor_cpu_start, descriptor_gpu_start) ==
-      ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-    return false;
+  // Get transient data needed for clearing.
+  ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_edram;
+  if (bindless_resources_used_) {
+    descriptor_edram = command_processor_->GetSystemBindlessViewHandlePair(
+        D3D12CommandProcessor::SystemBindlessView::kEDRAMRawUAV);
+  } else {
+    if (!command_processor_->RequestOneUseSingleViewDescriptors(
+            1, &descriptor_edram)) {
+      return false;
+    }
+    WriteEDRAMRawUAVDescriptor(descriptor_edram.first);
   }
 
   // Submit the clear.
@@ -1905,7 +1938,8 @@ bool RenderTargetCache::ResolveClear(uint32_t edram_base,
       (surface_pitch_tiles << 16);
   // When ROV is used, there's no 32-bit depth buffer.
   if (!edram_rov_used_ && is_depth &&
-      DepthRenderTargetFormat(format) == DepthRenderTargetFormat::kD24FS8) {
+      xenos::DepthRenderTargetFormat(format) ==
+          xenos::DepthRenderTargetFormat::kD24FS8) {
     root_constants.clear_depth24 = regs[XE_GPU_REG_RB_DEPTH_CLEAR].u32;
     // 20e4 [0,2), based on CFloat24 from d3dref9.dll and on 6e4 in DirectXTex.
     uint32_t depth24 = root_constants.clear_depth24 >> 8;
@@ -1935,11 +1969,11 @@ bool RenderTargetCache::ResolveClear(uint32_t edram_base,
     root_constants.clear_color_high = regs[reg].u32;
     command_processor_->SetComputePipeline(edram_clear_32bpp_pipeline_);
   }
+  auto command_list = command_processor_->GetDeferredCommandList();
   command_list->D3DSetComputeRootSignature(edram_clear_root_signature_);
   command_list->D3DSetComputeRoot32BitConstants(
       0, sizeof(root_constants) / sizeof(uint32_t), &root_constants, 0);
-  WriteEDRAMRawUAVDescriptor(descriptor_cpu_start);
-  command_list->D3DSetComputeRootDescriptorTable(1, descriptor_gpu_start);
+  command_list->D3DSetComputeRootDescriptorTable(1, descriptor_edram.second);
   // 1 group per 80x16 samples. Resolution scale handled in the shader itself.
   command_list->D3DDispatch(row_width_ss_div_80, rows, 1);
   CommitEDRAMBufferUAVWrites(true);
@@ -2150,7 +2184,7 @@ void RenderTargetCache::FlushAndUnbindRenderTargets() {
   ClearBindings();
 }
 
-void RenderTargetCache::WriteEDRAMUint32UAVDescriptor(
+void RenderTargetCache::WriteEDRAMR32UintUAVDescriptor(
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
   auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
   auto device = provider->GetDevice();
@@ -2158,46 +2192,70 @@ void RenderTargetCache::WriteEDRAMUint32UAVDescriptor(
       1, handle,
       provider->OffsetViewDescriptor(
           edram_buffer_descriptor_heap_start_,
-          uint32_t(EDRAMBufferDescriptorIndex::kUint32UAV)),
+          uint32_t(EDRAMBufferDescriptorIndex::kR32UintUAV)),
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
-ColorRenderTargetFormat RenderTargetCache::GetBaseColorFormat(
-    ColorRenderTargetFormat format) {
+void RenderTargetCache::WriteEDRAMRawSRVDescriptor(
+    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
+  auto device = provider->GetDevice();
+  device->CopyDescriptorsSimple(
+      1, handle,
+      provider->OffsetViewDescriptor(
+          edram_buffer_descriptor_heap_start_,
+          uint32_t(EDRAMBufferDescriptorIndex::kRawSRV)),
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+void RenderTargetCache::WriteEDRAMRawUAVDescriptor(
+    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
+  auto device = provider->GetDevice();
+  device->CopyDescriptorsSimple(
+      1, handle,
+      provider->OffsetViewDescriptor(
+          edram_buffer_descriptor_heap_start_,
+          uint32_t(EDRAMBufferDescriptorIndex::kRawUAV)),
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+xenos::ColorRenderTargetFormat RenderTargetCache::GetBaseColorFormat(
+    xenos::ColorRenderTargetFormat format) {
   switch (format) {
-    case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-      return ColorRenderTargetFormat::k_8_8_8_8;
-    case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
-      return ColorRenderTargetFormat::k_2_10_10_10;
-    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-      return ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+      return xenos::ColorRenderTargetFormat::k_8_8_8_8;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+      return xenos::ColorRenderTargetFormat::k_2_10_10_10;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+      return xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
     default:
       return format;
   }
 }
 
 DXGI_FORMAT RenderTargetCache::GetColorDXGIFormat(
-    ColorRenderTargetFormat format) {
+    xenos::ColorRenderTargetFormat format) {
   switch (format) {
-    case ColorRenderTargetFormat::k_8_8_8_8:
-    case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case ColorRenderTargetFormat::k_2_10_10_10:
-    case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
       return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-    case ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-    case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case ColorRenderTargetFormat::k_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16:
       return DXGI_FORMAT_R16G16_SNORM;
-    case ColorRenderTargetFormat::k_16_16_16_16:
+    case xenos::ColorRenderTargetFormat::k_16_16_16_16:
       return DXGI_FORMAT_R16G16B16A16_SNORM;
-    case ColorRenderTargetFormat::k_16_16_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
       return DXGI_FORMAT_R16G16_FLOAT;
-    case ColorRenderTargetFormat::k_32_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_32_FLOAT:
       return DXGI_FORMAT_R32_FLOAT;
-    case ColorRenderTargetFormat::k_32_32_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
       return DXGI_FORMAT_R32G32_FLOAT;
     default:
       break;
@@ -2283,13 +2341,22 @@ void RenderTargetCache::RestoreEDRAMSnapshot(const void* snapshot) {
     // Clear and ignore the old 32-bit float depth - the non-ROV path is
     // inaccurate anyway, and this is backend-specific, not a part of a guest
     // trace.
-    D3D12_CPU_DESCRIPTOR_HANDLE shader_visbile_descriptor_cpu;
-    D3D12_GPU_DESCRIPTOR_HANDLE shader_visbile_descriptor_gpu;
-    if (command_processor_->RequestViewDescriptors(
-            ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid, 1, 1,
-            shader_visbile_descriptor_cpu, shader_visbile_descriptor_gpu) !=
-        ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-      WriteEDRAMUint32UAVDescriptor(shader_visbile_descriptor_cpu);
+    bool edram_shader_visible_r32_uav_obtained;
+    ui::d3d12::util::DescriptorCPUGPUHandlePair edram_shader_visible_r32_uav;
+    if (bindless_resources_used_) {
+      edram_shader_visible_r32_uav_obtained = true;
+      edram_shader_visible_r32_uav =
+          command_processor_->GetSystemBindlessViewHandlePair(
+              D3D12CommandProcessor::SystemBindlessView::kEDRAMR32UintUAV);
+    } else {
+      edram_shader_visible_r32_uav_obtained =
+          command_processor_->RequestOneUseSingleViewDescriptors(
+              1, &edram_shader_visible_r32_uav);
+      if (edram_shader_visible_r32_uav_obtained) {
+        WriteEDRAMR32UintUAVDescriptor(edram_shader_visible_r32_uav.first);
+      }
+    }
+    if (edram_shader_visible_r32_uav_obtained) {
       UINT clear_value[4] = {0, 0, 0, 0};
       D3D12_RECT clear_rect;
       clear_rect.left = kEDRAMSize >> 2;
@@ -2301,13 +2368,11 @@ void RenderTargetCache::RestoreEDRAMSnapshot(const void* snapshot) {
       // ClearUnorderedAccessView takes a shader-visible GPU descriptor and a
       // non-shader-visible CPU descriptor.
       command_list->D3DClearUnorderedAccessViewUint(
-          shader_visbile_descriptor_gpu,
+          edram_shader_visible_r32_uav.second,
           provider->OffsetViewDescriptor(
               edram_buffer_descriptor_heap_start_,
-              uint32_t(EDRAMBufferDescriptorIndex::kUint32UAV)),
+              uint32_t(EDRAMBufferDescriptorIndex::kR32UintUAV)),
           edram_buffer_, clear_value, 1, &clear_rect);
-    } else {
-      XELOGE("Failed to get a UAV descriptor for invalidating 32-bit depth");
     }
   }
 }
@@ -2343,33 +2408,9 @@ void RenderTargetCache::CommitEDRAMBufferUAVWrites(bool force) {
   edram_buffer_modified_ = false;
 }
 
-void RenderTargetCache::WriteEDRAMRawSRVDescriptor(
-    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
-  auto device = provider->GetDevice();
-  device->CopyDescriptorsSimple(
-      1, handle,
-      provider->OffsetViewDescriptor(
-          edram_buffer_descriptor_heap_start_,
-          uint32_t(EDRAMBufferDescriptorIndex::kRawSRV)),
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-}
-
-void RenderTargetCache::WriteEDRAMRawUAVDescriptor(
-    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
-  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
-  auto device = provider->GetDevice();
-  device->CopyDescriptorsSimple(
-      1, handle,
-      provider->OffsetViewDescriptor(
-          edram_buffer_descriptor_heap_start_,
-          uint32_t(EDRAMBufferDescriptorIndex::kRawUAV)),
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-}
-
 void RenderTargetCache::ClearBindings() {
   current_surface_pitch_ = 0;
-  current_msaa_samples_ = MsaaSamples::k1X;
+  current_msaa_samples_ = xenos::MsaaSamples::k1X;
   current_edram_max_rows_ = 0;
   std::memset(current_bindings_, 0, sizeof(current_bindings_));
   apply_to_command_list_ = true;
@@ -2438,8 +2479,9 @@ bool RenderTargetCache::GetResourceDesc(RenderTargetKey key,
     return false;
   }
   DXGI_FORMAT dxgi_format =
-      key.is_depth ? GetDepthDXGIFormat(DepthRenderTargetFormat(key.format))
-                   : GetColorDXGIFormat(ColorRenderTargetFormat(key.format));
+      key.is_depth
+          ? GetDepthDXGIFormat(xenos::DepthRenderTargetFormat(key.format))
+          : GetColorDXGIFormat(xenos::ColorRenderTargetFormat(key.format));
   if (dxgi_format == DXGI_FORMAT_UNKNOWN) {
     return false;
   }
@@ -2608,7 +2650,7 @@ RenderTargetCache::RenderTarget* RenderTargetCache::FindOrCreateRenderTarget(
 }
 
 bool RenderTargetCache::GetEDRAMLayout(
-    uint32_t pitch_pixels, MsaaSamples msaa_samples, bool is_64bpp,
+    uint32_t pitch_pixels, xenos::MsaaSamples msaa_samples, bool is_64bpp,
     uint32_t& base_in_out, D3D12_RECT& rect_in_out, uint32_t& pitch_tiles_out,
     uint32_t& row_width_ss_div_80_out, uint32_t& rows_out) {
   if (pitch_pixels == 0 || rect_in_out.right <= 0 || rect_in_out.bottom <= 0 ||
@@ -2624,8 +2666,8 @@ bool RenderTargetCache::GetEDRAMLayout(
     return false;
   }
 
-  uint32_t samples_x_log2 = msaa_samples >= MsaaSamples::k4X ? 1 : 0;
-  uint32_t samples_y_log2 = msaa_samples >= MsaaSamples::k2X ? 1 : 0;
+  uint32_t samples_x_log2 = msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
+  uint32_t samples_y_log2 = msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0;
   uint32_t sample_size_log2 = is_64bpp ? 1 : 0;
 
   uint32_t pitch_tiles = (((pitch_pixels << samples_x_log2) + 79) / 80)
@@ -2668,14 +2710,16 @@ bool RenderTargetCache::GetEDRAMLayout(
 RenderTargetCache::EDRAMLoadStoreMode RenderTargetCache::GetLoadStoreMode(
     bool is_depth, uint32_t format) {
   if (is_depth) {
-    return DepthRenderTargetFormat(format) == DepthRenderTargetFormat::kD24FS8
+    return xenos::DepthRenderTargetFormat(format) ==
+                   xenos::DepthRenderTargetFormat::kD24FS8
                ? EDRAMLoadStoreMode::kDepthFloat
                : EDRAMLoadStoreMode::kDepthUnorm;
   }
-  ColorRenderTargetFormat color_format = ColorRenderTargetFormat(format);
-  if (color_format == ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+  xenos::ColorRenderTargetFormat color_format =
+      xenos::ColorRenderTargetFormat(format);
+  if (color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
       color_format ==
-          ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
+          xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
     return EDRAMLoadStoreMode::kColor7e3;
   }
   return IsColorFormat64bpp(color_format) ? EDRAMLoadStoreMode::kColor64bpp
@@ -2710,13 +2754,24 @@ void RenderTargetCache::StoreRenderTargetsToEDRAM() {
   }
 
   // Allocate descriptors for the buffers.
-  D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
-  D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
-  if (command_processor_->RequestViewDescriptors(
-          ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid, 2, 2,
-          descriptor_cpu_start, descriptor_gpu_start) ==
-      ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-    return;
+  ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_edram;
+  ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_source;
+  if (bindless_resources_used_) {
+    if (!command_processor_->RequestOneUseSingleViewDescriptors(
+            1, &descriptor_source)) {
+      return;
+    }
+    descriptor_edram = command_processor_->GetSystemBindlessViewHandlePair(
+        D3D12CommandProcessor::SystemBindlessView::kEDRAMRawUAV);
+  } else {
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptors[2];
+    if (!command_processor_->RequestOneUseSingleViewDescriptors(2,
+                                                                descriptors)) {
+      return;
+    }
+    descriptor_edram = descriptors[0];
+    WriteEDRAMRawUAVDescriptor(descriptor_edram.first);
+    descriptor_source = descriptors[1];
   }
 
   // Get the buffer for copying.
@@ -2740,14 +2795,13 @@ void RenderTargetCache::StoreRenderTargetsToEDRAM() {
   TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   // Set up the bindings.
-  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
-  auto device = provider->GetDevice();
+  auto device =
+      command_processor_->GetD3D12Context()->GetD3D12Provider()->GetDevice();
   command_list->D3DSetComputeRootSignature(edram_load_store_root_signature_);
-  ui::d3d12::util::CreateRawBufferSRV(device, descriptor_cpu_start, copy_buffer,
-                                      copy_buffer_size);
-  WriteEDRAMRawUAVDescriptor(
-      provider->OffsetViewDescriptor(descriptor_cpu_start, 1));
-  command_list->D3DSetComputeRootDescriptorTable(1, descriptor_gpu_start);
+  ui::d3d12::util::CreateBufferRawSRV(device, descriptor_source.first,
+                                      copy_buffer, copy_buffer_size);
+  command_list->D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
+  command_list->D3DSetComputeRootDescriptorTable(1, descriptor_edram.second);
 
   // Sort the bindings in ascending order of EDRAM base so data in the render
   // targets placed farther in EDRAM isn't lost in case of overlap.
@@ -2771,7 +2825,7 @@ void RenderTargetCache::StoreRenderTargetsToEDRAM() {
   // Calculate the dispatch width.
   uint32_t surface_pitch_ss =
       current_surface_pitch_ *
-      (current_msaa_samples_ >= MsaaSamples::k4X ? 2 : 1);
+      (current_msaa_samples_ >= xenos::MsaaSamples::k4X ? 2 : 1);
   uint32_t surface_pitch_tiles = (surface_pitch_ss + 79) / 80;
   assert_true(surface_pitch_tiles != 0);
 
@@ -2801,7 +2855,7 @@ void RenderTargetCache::StoreRenderTargetsToEDRAM() {
     uint32_t rt_pitch_tiles = surface_pitch_tiles;
     if (!render_target->key.is_depth &&
         IsColorFormat64bpp(
-            ColorRenderTargetFormat(render_target->key.format))) {
+            xenos::ColorRenderTargetFormat(render_target->key.format))) {
       rt_pitch_tiles *= 2;
     }
     // TODO(Triang3l): log2(sample count, resolution scale).
@@ -2857,13 +2911,23 @@ void RenderTargetCache::LoadRenderTargetsFromEDRAM(
   auto command_list = command_processor_->GetDeferredCommandList();
 
   // Allocate descriptors for the buffers.
-  D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu_start;
-  D3D12_GPU_DESCRIPTOR_HANDLE descriptor_gpu_start;
-  if (command_processor_->RequestViewDescriptors(
-          ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid, 2, 2,
-          descriptor_cpu_start, descriptor_gpu_start) ==
-      ui::d3d12::DescriptorHeapPool::kHeapIndexInvalid) {
-    return;
+  ui::d3d12::util::DescriptorCPUGPUHandlePair descriptor_dest, descriptor_edram;
+  if (bindless_resources_used_) {
+    if (!command_processor_->RequestOneUseSingleViewDescriptors(
+            1, &descriptor_dest)) {
+      return;
+    }
+    descriptor_edram = command_processor_->GetSystemBindlessViewHandlePair(
+        D3D12CommandProcessor::SystemBindlessView::kEDRAMRawSRV);
+  } else {
+    ui::d3d12::util::DescriptorCPUGPUHandlePair descriptors[2];
+    if (!command_processor_->RequestOneUseSingleViewDescriptors(2,
+                                                                descriptors)) {
+      return;
+    }
+    descriptor_dest = descriptors[0];
+    descriptor_edram = descriptors[1];
+    WriteEDRAMRawSRVDescriptor(descriptor_edram.first);
   }
 
   // Get the buffer for copying.
@@ -2892,14 +2956,13 @@ void RenderTargetCache::LoadRenderTargetsFromEDRAM(
   TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
   // Set up the bindings.
-  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
-  auto device = provider->GetDevice();
+  auto device =
+      command_processor_->GetD3D12Context()->GetD3D12Provider()->GetDevice();
   command_list->D3DSetComputeRootSignature(edram_load_store_root_signature_);
-  WriteEDRAMRawSRVDescriptor(descriptor_cpu_start);
-  ui::d3d12::util::CreateRawBufferUAV(
-      device, provider->OffsetViewDescriptor(descriptor_cpu_start, 1),
-      copy_buffer, copy_buffer_size);
-  command_list->D3DSetComputeRootDescriptorTable(1, descriptor_gpu_start);
+  command_list->D3DSetComputeRootDescriptorTable(2, descriptor_edram.second);
+  ui::d3d12::util::CreateBufferRawUAV(device, descriptor_dest.first,
+                                      copy_buffer, copy_buffer_size);
+  command_list->D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
 
   // Load each render target.
   for (uint32_t i = 0; i < render_target_count; ++i) {
@@ -2913,7 +2976,7 @@ void RenderTargetCache::LoadRenderTargetsFromEDRAM(
     uint32_t edram_pitch_tiles = render_target->key.width_ss_div_80;
     if (!render_target->key.is_depth &&
         IsColorFormat64bpp(
-            ColorRenderTargetFormat(render_target->key.format))) {
+            xenos::ColorRenderTargetFormat(render_target->key.format))) {
       edram_pitch_tiles *= 2;
     }
     // Clamp the height if somehow requested a render target that is too large.

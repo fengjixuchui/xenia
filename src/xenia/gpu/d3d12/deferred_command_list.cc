@@ -17,8 +17,6 @@ namespace xe {
 namespace gpu {
 namespace d3d12 {
 
-constexpr size_t DeferredCommandList::kAlignment;
-
 DeferredCommandList::DeferredCommandList(
     D3D12CommandProcessor* command_processor, size_t initial_size)
     : command_processor_(command_processor) {
@@ -61,6 +59,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       case Command::kCopyTexture: {
         auto& args = *reinterpret_cast<const CopyTextureArguments*>(stream);
         command_list->CopyTextureRegion(&args.dst, 0, 0, 0, &args.src, nullptr);
+      } break;
+      case Command::kCopyTextureRegion: {
+        auto& args =
+            *reinterpret_cast<const CopyTextureRegionArguments*>(stream);
+        command_list->CopyTextureRegion(&args.dst, args.dst_x, args.dst_y,
+                                        args.dst_z, &args.src, &args.src_box);
       } break;
       case Command::kD3DDispatch: {
         if (current_pipeline_state != nullptr) {

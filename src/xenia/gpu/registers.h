@@ -143,6 +143,17 @@ union SQ_CONTEXT_MISC {
   static constexpr Register register_index = XE_GPU_REG_SQ_CONTEXT_MISC;
 };
 
+union SQ_INTERPOLATOR_CNTL {
+  struct {
+    uint32_t param_shade : 16;  // +0
+    // SampleLocation bits - 0 for centroid, 1 for center, if
+    // SQ_CONTEXT_MISC::sc_sample_cntl is kCentroidsAndCenters.
+    uint32_t sampling_pattern : 16;  // +16
+  };
+  uint32_t value;
+  static constexpr Register register_index = XE_GPU_REG_SQ_INTERPOLATOR_CNTL;
+};
+
 /*******************************************************************************
  __   _____ ___ _____ _____  __
  \ \ / / __| _ \_   _| __\ \/ /
@@ -164,11 +175,11 @@ union SQ_CONTEXT_MISC {
 union VGT_DRAW_INITIATOR {
   // Different than on A2xx and R6xx/R7xx.
   struct {
-    PrimitiveType prim_type : 6;            // +0
+    xenos::PrimitiveType prim_type : 6;     // +0
     xenos::SourceSelect source_select : 2;  // +6
     xenos::MajorMode major_mode : 2;        // +8
     uint32_t : 1;                           // +10
-    IndexFormat index_size : 1;             // +11
+    xenos::IndexFormat index_size : 1;      // +11
     uint32_t not_eop : 1;                   // +12
     uint32_t : 3;                           // +13
     uint32_t num_indices : 16;              // +16
@@ -383,10 +394,10 @@ union RB_MODECONTROL {
 
 union RB_SURFACE_INFO {
   struct {
-    uint32_t surface_pitch : 14;   // +0
-    uint32_t : 2;                  // +14
-    MsaaSamples msaa_samples : 2;  // +16
-    uint32_t hiz_pitch : 14;       // +18
+    uint32_t surface_pitch : 14;          // +0
+    uint32_t : 2;                         // +14
+    xenos::MsaaSamples msaa_samples : 2;  // +16
+    uint32_t hiz_pitch : 14;              // +18
   };
   uint32_t value;
   static constexpr Register register_index = XE_GPU_REG_RB_SURFACE_INFO;
@@ -394,11 +405,44 @@ union RB_SURFACE_INFO {
 
 union RB_COLORCONTROL {
   struct {
-    CompareFunction alpha_func : 3;     // +0
-    uint32_t alpha_test_enable : 1;     // +3
-    uint32_t alpha_to_mask_enable : 1;  // +4
+    xenos::CompareFunction alpha_func : 3;  // +0
+    uint32_t alpha_test_enable : 1;         // +3
+    uint32_t alpha_to_mask_enable : 1;      // +4
     // Everything in between was added on Adreno.
-    uint32_t : 19;                       // +5
+    uint32_t : 19;  // +5
+    // According to tests on an Adreno 200 device (LG Optimus L7), done by
+    // drawing 0.5x0.5 rectangles in different corners of four pixels in a quad
+    // to a multisampled GLSurfaceView, the coverage mask is the following for 4
+    // samples:
+    // 0.25)  [0.25, 0.5)  [0.5, 0.75)  [0.75, 1)   [1
+    //  --        --           --          --       --
+    // |  |      |  |         | #|        |##|     |##|
+    // |  |      |# |         |# |        |# |     |##|
+    //  --        --           --          --       --
+    // (gl_FragCoord.y near 0 in the top, near 1 in the bottom here - D3D-like.)
+    // For 2 samples, the top sample (closer to gl_FragCoord.y 0) is covered
+    // when alpha is in [0.5, 1), the bottom sample is covered when the alpha is
+    // [1. With these thresholds, however, in Red Dead Redemption, almost all
+    // distant trees are transparent, this is asymmetric - fully transparent for
+    // a quarter of the range (or even half of the range for 2x and almost the
+    // entire range for 1x), but fully opaque only in one value.
+    // Though, 2, 2, 2, 2 offset values are commonly used for undithered alpha
+    // to coverage (in games such as Red Dead Redemption, and overall in AMD
+    // driver implementations) - it appears that 2, 2, 2, 2 offsets are supposed
+    // to make this symmetric.
+    // Both Red Dead Redemption and RADV (which used AMDVLK as a reference) use
+    // 3, 1, 0, 2 offsets for dithered alpha to mask.
+    // https://gitlab.freedesktop.org/nchery/mesa/commit/8a52e4cc4fad4f1c75acc0badd624778f9dfe202
+    // It appears that the offsets lower the thresholds by (offset / 4 /
+    // sample count). That's consistent with both 2, 2, 2, 2 making the test
+    // symmetric and 0, 0, 0, 0 (forgetting to set the offset values) resulting
+    // in what the official Adreno 200 driver for Android (which is pretty buggy
+    // overall) produces.
+    // According to Evergreen register reference:
+    // - offset0 is for pixel (0, 0) in each quad.
+    // - offset1 is for pixel (0, 1) in each quad.
+    // - offset2 is for pixel (1, 0) in each quad.
+    // - offset3 is for pixel (1, 1) in each quad.
     uint32_t alpha_to_mask_offset0 : 2;  // +24
     uint32_t alpha_to_mask_offset1 : 2;  // +26
     uint32_t alpha_to_mask_offset2 : 2;  // +28
@@ -410,10 +454,10 @@ union RB_COLORCONTROL {
 
 union RB_COLOR_INFO {
   struct {
-    uint32_t color_base : 12;                  // +0
-    uint32_t : 4;                              // +12
-    ColorRenderTargetFormat color_format : 4;  // +16
-    int32_t color_exp_bias : 6;                // +20
+    uint32_t color_base : 12;                         // +0
+    uint32_t : 4;                                     // +12
+    xenos::ColorRenderTargetFormat color_format : 4;  // +16
+    int32_t color_exp_bias : 6;                       // +20
   };
   uint32_t value;
   static constexpr Register register_index = XE_GPU_REG_RB_COLOR_INFO;
@@ -446,13 +490,13 @@ union RB_COLOR_MASK {
 
 union RB_BLENDCONTROL {
   struct {
-    BlendFactor color_srcblend : 5;   // +0
-    BlendOp color_comb_fcn : 3;       // +5
-    BlendFactor color_destblend : 5;  // +8
-    uint32_t : 3;                     // +13
-    BlendFactor alpha_srcblend : 5;   // +16
-    BlendOp alpha_comb_fcn : 3;       // +21
-    BlendFactor alpha_destblend : 5;  // +24
+    xenos::BlendFactor color_srcblend : 5;   // +0
+    xenos::BlendOp color_comb_fcn : 3;       // +5
+    xenos::BlendFactor color_destblend : 5;  // +8
+    uint32_t : 3;                            // +13
+    xenos::BlendFactor alpha_srcblend : 5;   // +16
+    xenos::BlendOp alpha_comb_fcn : 3;       // +21
+    xenos::BlendFactor alpha_destblend : 5;  // +24
     // BLEND_FORCE_ENABLE and BLEND_FORCE were added on Adreno.
   };
   uint32_t value;
@@ -467,17 +511,17 @@ union RB_DEPTHCONTROL {
     uint32_t z_enable : 1;        // +1
     uint32_t z_write_enable : 1;  // +2
     // EARLY_Z_ENABLE was added on Adreno.
-    uint32_t : 1;                        // +3
-    CompareFunction zfunc : 3;           // +4
-    uint32_t backface_enable : 1;        // +7
-    CompareFunction stencilfunc : 3;     // +8
-    StencilOp stencilfail : 3;           // +11
-    StencilOp stencilzpass : 3;          // +14
-    StencilOp stencilzfail : 3;          // +17
-    CompareFunction stencilfunc_bf : 3;  // +20
-    StencilOp stencilfail_bf : 3;        // +23
-    StencilOp stencilzpass_bf : 3;       // +26
-    StencilOp stencilzfail_bf : 3;       // +29
+    uint32_t : 1;                               // +3
+    xenos::CompareFunction zfunc : 3;           // +4
+    uint32_t backface_enable : 1;               // +7
+    xenos::CompareFunction stencilfunc : 3;     // +8
+    xenos::StencilOp stencilfail : 3;           // +11
+    xenos::StencilOp stencilzpass : 3;          // +14
+    xenos::StencilOp stencilzfail : 3;          // +17
+    xenos::CompareFunction stencilfunc_bf : 3;  // +20
+    xenos::StencilOp stencilfail_bf : 3;        // +23
+    xenos::StencilOp stencilzpass_bf : 3;       // +26
+    xenos::StencilOp stencilzfail_bf : 3;       // +29
   };
   uint32_t value;
   static constexpr Register register_index = XE_GPU_REG_RB_DEPTHCONTROL;
@@ -496,9 +540,9 @@ union RB_STENCILREFMASK {
 
 union RB_DEPTH_INFO {
   struct {
-    uint32_t depth_base : 12;                  // +0
-    uint32_t : 4;                              // +12
-    DepthRenderTargetFormat depth_format : 1;  // +16
+    uint32_t depth_base : 12;                         // +0
+    uint32_t : 4;                                     // +12
+    xenos::DepthRenderTargetFormat depth_format : 1;  // +16
   };
   uint32_t value;
   static constexpr Register register_index = XE_GPU_REG_RB_DEPTH_INFO;
@@ -521,14 +565,14 @@ union RB_COPY_CONTROL {
 
 union RB_COPY_DEST_INFO {
   struct {
-    Endian128 copy_dest_endian : 3;    // +0
-    uint32_t copy_dest_array : 1;      // +3
-    uint32_t copy_dest_slice : 3;      // +4
-    ColorFormat copy_dest_format : 6;  // +7
-    uint32_t copy_dest_number : 3;     // +13
-    int32_t copy_dest_exp_bias : 6;    // +16
-    uint32_t : 2;                      // +22
-    uint32_t copy_dest_swap : 1;       // +24
+    xenos::Endian128 copy_dest_endian : 3;    // +0
+    uint32_t copy_dest_array : 1;             // +3
+    uint32_t copy_dest_slice : 3;             // +4
+    xenos::ColorFormat copy_dest_format : 6;  // +7
+    uint32_t copy_dest_number : 3;            // +13
+    int32_t copy_dest_exp_bias : 6;           // +16
+    uint32_t : 2;                             // +22
+    uint32_t copy_dest_swap : 1;              // +24
   };
   uint32_t value;
   static constexpr Register register_index = XE_GPU_REG_RB_COPY_DEST_INFO;

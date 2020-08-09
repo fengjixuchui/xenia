@@ -30,12 +30,14 @@ void GetSubresourcesFromFetchConstant(
     uint32_t* height_out, uint32_t* depth_or_faces_out, uint32_t* base_page_out,
     uint32_t* mip_page_out, uint32_t* mip_min_level_out,
     uint32_t* mip_max_level_out,
-    TextureFilter sampler_mip_filter = TextureFilter::kUseFetchConst);
+    xenos::TextureFilter sampler_mip_filter =
+        xenos::TextureFilter::kUseFetchConst);
 
 // Calculates width, height and depth of the image backing the guest mipmap (or
 // the base level if mip is 0).
-void GetGuestMipBlocks(Dimension dimension, uint32_t width, uint32_t height,
-                       uint32_t depth, TextureFormat format, uint32_t mip,
+void GetGuestMipBlocks(xenos::DataDimension dimension, uint32_t width,
+                       uint32_t height, uint32_t depth,
+                       xenos::TextureFormat format, uint32_t mip,
                        uint32_t& width_blocks_out, uint32_t& height_blocks_out,
                        uint32_t& depth_blocks_out);
 
@@ -46,7 +48,7 @@ void GetGuestMipBlocks(Dimension dimension, uint32_t width, uint32_t height,
 uint32_t GetGuestMipSliceStorageSize(uint32_t width_blocks,
                                      uint32_t height_blocks,
                                      uint32_t depth_blocks, bool is_tiled,
-                                     TextureFormat format,
+                                     xenos::TextureFormat format,
                                      uint32_t* row_pitch_out,
                                      bool align_4kb = true);
 
@@ -60,26 +62,15 @@ inline uint32_t GetPackedMipLevel(uint32_t width, uint32_t height) {
 // returns false) if the mip level is not packed. Width, height and depth are in
 // texels. For non-3D textures, set depth to 1.
 bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
-                        TextureFormat format, uint32_t mip, uint32_t& x_blocks,
-                        uint32_t& y_blocks, uint32_t& z_blocks);
-
-// Calculates the index of the smallest mip (1x1x1 for unpacked or min(w,h)<=16
-// packed mips) for a texture. For non-3D textures, set the depth to 1.
-inline uint32_t GetSmallestMipLevel(uint32_t width, uint32_t height,
-                                    uint32_t depth, bool packed_mips) {
-  uint32_t size = std::max(width, height);
-  size = std::max(size, depth);
-  uint32_t smallest_mip = xe::log2_ceil(size);
-  if (packed_mips) {
-    smallest_mip = std::min(smallest_mip, GetPackedMipLevel(width, height));
-  }
-  return smallest_mip;
-}
+                        xenos::TextureFormat format, uint32_t mip,
+                        uint32_t& x_blocks, uint32_t& y_blocks,
+                        uint32_t& z_blocks);
 
 // Returns the total size of memory the texture uses starting from its base and
 // mip addresses, in bytes (both are optional).
-void GetTextureTotalSize(Dimension dimension, uint32_t width, uint32_t height,
-                         uint32_t depth, TextureFormat format, bool is_tiled,
+void GetTextureTotalSize(xenos::DataDimension dimension, uint32_t width,
+                         uint32_t height, uint32_t depth,
+                         xenos::TextureFormat format, bool is_tiled,
                          bool packed_mips, uint32_t mip_max_level,
                          uint32_t* base_size_out, uint32_t* mip_size_out);
 
@@ -119,12 +110,19 @@ int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t width,
 // the fetch constant, so the shader can apply TextureSigns after reading a
 // pre-swizzled texture. 0/1 elements are considered unsigned (and not biased),
 // however, if all non-constant components are signed, 0/1 are considered signed
-// too (because in backends, unsigned and signed textures may use separate views
-// with different formats, so just one view is used for both signed and constant
-// components).
-uint32_t SwizzleSigns(const xenos::xe_gpu_texture_fetch_t& fetch,
-                      bool* any_unsigned_out = nullptr,
-                      bool* any_signed_out = nullptr);
+// too (because in backends, unsigned and signed textures may use separate host
+// textures with different formats, so just one is used for both signed and
+// constant components).
+uint8_t SwizzleSigns(const xenos::xe_gpu_texture_fetch_t& fetch);
+constexpr bool IsAnySignNotSigned(uint8_t packed_signs) {
+  return packed_signs != uint32_t(xenos::TextureSign::kSigned) * 0b01010101;
+}
+constexpr bool IsAnySignSigned(uint8_t packed_signs) {
+  // Make signed 00 - check if all are 01, 10 or 11.
+  uint32_t xor_signed =
+      packed_signs ^ (uint32_t(xenos::TextureSign::kSigned) * 0b01010101);
+  return ((xor_signed | (xor_signed >> 1)) & 0b01010101) != 0b01010101;
+}
 
 }  // namespace texture_util
 }  // namespace gpu

@@ -61,19 +61,19 @@ namespace d3d12 {
 #include "xenia/gpu/d3d12/shaders/dxbc/primitive_rectangle_list_gs.h"
 #include "xenia/gpu/d3d12/shaders/dxbc/tessellation_vs.h"
 
-constexpr uint32_t PipelineCache::PipelineDescription::kVersion;
-
 PipelineCache::PipelineCache(D3D12CommandProcessor* command_processor,
-                             RegisterFile* register_file, bool edram_rov_used,
+                             RegisterFile* register_file,
+                             bool bindless_resources_used, bool edram_rov_used,
                              uint32_t resolution_scale)
     : command_processor_(command_processor),
       register_file_(register_file),
+      bindless_resources_used_(bindless_resources_used),
       edram_rov_used_(edram_rov_used),
       resolution_scale_(resolution_scale) {
   auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
 
   shader_translator_ = std::make_unique<DxbcShaderTranslator>(
-      provider->GetAdapterVendorID(), edram_rov_used_,
+      provider->GetAdapterVendorID(), bindless_resources_used_, edram_rov_used_,
       provider->GetGraphicsAnalysis() != nullptr);
 
   if (edram_rov_used_) {
@@ -178,6 +178,13 @@ void PipelineCache::ClearCache(bool shutting_down) {
   COUNT_profile_set("gpu/pipeline_cache/pipeline_states", 0);
 
   // Destroy all shaders.
+  command_processor_->NotifyShaderBindingsLayoutUIDsInvalidated();
+  if (bindless_resources_used_) {
+    bindless_sampler_layout_map_.clear();
+    bindless_sampler_layouts_.clear();
+  }
+  texture_binding_layout_map_.clear();
+  texture_binding_layouts_.clear();
   for (auto it : shader_map_) {
     delete it.second;
   }
@@ -264,8 +271,8 @@ void PipelineCache::InitializeShaderStorage(
     auto shader_translation_thread_function = [&]() {
       auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
       DxbcShaderTranslator translator(
-          provider->GetAdapterVendorID(), edram_rov_used_,
-          provider->GetGraphicsAnalysis() != nullptr);
+          provider->GetAdapterVendorID(), bindless_resources_used_,
+          edram_rov_used_, provider->GetGraphicsAnalysis() != nullptr);
       for (;;) {
         std::pair<ShaderStoredHeader, D3D12Shader*> shader_to_translate;
         for (;;) {
@@ -287,11 +294,11 @@ void PipelineCache::InitializeShaderStorage(
                 translator, shader_to_translate.second,
                 shader_to_translate.first.sq_program_cntl,
                 shader_to_translate.first.host_vertex_shader_type)) {
-          std::unique_lock<std::mutex> lock(shaders_failed_to_translate_mutex);
+          std::lock_guard<std::mutex> lock(shaders_failed_to_translate_mutex);
           shaders_failed_to_translate.push_back(shader_to_translate.second);
         }
         {
-          std::unique_lock<std::mutex> lock(shaders_translation_thread_mutex);
+          std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
           --shader_translation_threads_busy;
         }
       }
@@ -340,7 +347,7 @@ void PipelineCache::InitializeShaderStorage(
       // one.
       size_t shader_translation_threads_needed;
       {
-        std::unique_lock<std::mutex> lock(shaders_translation_thread_mutex);
+        std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
         shader_translation_threads_needed =
             std::min(shader_translation_threads_busy +
                          shaders_to_translate.size() + size_t(1),
@@ -353,7 +360,7 @@ void PipelineCache::InitializeShaderStorage(
         shader_translation_threads.back()->set_name("Shader Translation");
       }
       {
-        std::unique_lock<std::mutex> lock(shaders_translation_thread_mutex);
+        std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
         shaders_to_translate.emplace_back(shader_header, shader);
       }
       shaders_translation_thread_cond.notify_one();
@@ -362,7 +369,7 @@ void PipelineCache::InitializeShaderStorage(
     }
     if (!shader_translation_threads.empty()) {
       {
-        std::unique_lock<std::mutex> lock(shaders_translation_thread_mutex);
+        std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
         shader_translation_threads_shutdown = true;
       }
       shaders_translation_thread_cond.notify_all();
@@ -662,7 +669,7 @@ void PipelineCache::EndSubmission() {
   if (shader_storage_file_flush_needed_ ||
       pipeline_state_storage_file_flush_needed_) {
     {
-      std::unique_lock<std::mutex> lock(storage_write_request_lock_);
+      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
       if (shader_storage_file_flush_needed_) {
         storage_write_flush_shaders_ = true;
       }
@@ -705,7 +712,7 @@ bool PipelineCache::IsCreatingPipelineStates() {
   return !creation_queue_.empty() || creation_threads_busy_ != 0;
 }
 
-D3D12Shader* PipelineCache::LoadShader(ShaderType shader_type,
+D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type,
                                        uint32_t guest_address,
                                        const uint32_t* host_address,
                                        uint32_t dword_count) {
@@ -750,7 +757,7 @@ Shader::HostVertexShaderType PipelineCache::GetHostVertexShaderTypeIfValid()
   xenos::TessellationMode tessellation_mode =
       regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
   switch (vgt_draw_initiator.prim_type) {
-    case PrimitiveType::kTriangleList:
+    case xenos::PrimitiveType::kTriangleList:
       // Also supported by triangle strips and fans according to:
       // https://www.khronos.org/registry/OpenGL/extensions/AMD/AMD_vertex_shader_tessellator.txt
       // Would need to convert those to triangle lists, but haven't seen any
@@ -769,7 +776,7 @@ Shader::HostVertexShaderType PipelineCache::GetHostVertexShaderTypeIfValid()
           break;
       }
       break;
-    case PrimitiveType::kQuadList:
+    case xenos::PrimitiveType::kQuadList:
       switch (tessellation_mode) {
         // Also supported by quad strips according to:
         // https://www.khronos.org/registry/OpenGL/extensions/AMD/AMD_vertex_shader_tessellator.txt
@@ -784,11 +791,11 @@ Shader::HostVertexShaderType PipelineCache::GetHostVertexShaderTypeIfValid()
           break;
       }
       break;
-    case PrimitiveType::kTrianglePatch:
+    case xenos::PrimitiveType::kTrianglePatch:
       // - Banjo-Kazooie: Nuts & Bolts - water - adaptive.
       // - Halo 3 - water - adaptive.
       return Shader::HostVertexShaderType::kTriangleDomainPatchIndexed;
-    case PrimitiveType::kQuadPatch:
+    case xenos::PrimitiveType::kQuadPatch:
       // - Fable II - continuous.
       // - Viva Pinata - garden ground - adaptive.
       return Shader::HostVertexShaderType::kQuadDomainPatchIndexed;
@@ -856,7 +863,8 @@ bool PipelineCache::EnsureShadersTranslated(
 
 bool PipelineCache::ConfigurePipeline(
     D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
-    PrimitiveType primitive_type, IndexFormat index_format, bool early_z,
+    xenos::PrimitiveType primitive_type, xenos::IndexFormat index_format,
+    bool early_z,
     const RenderTargetCache::PipelineRenderTarget render_targets[5],
     void** pipeline_state_handle_out,
     ID3D12RootSignature** root_signature_out) {
@@ -955,52 +963,170 @@ bool PipelineCache::TranslateShader(
     return false;
   }
 
-  uint32_t texture_srv_count;
-  const DxbcShaderTranslator::TextureSRV* texture_srvs =
-      translator.GetTextureSRVs(texture_srv_count);
+  const char* host_shader_type;
+  if (shader->type() == xenos::ShaderType::kVertex) {
+    switch (shader->host_vertex_shader_type()) {
+      case Shader::HostVertexShaderType::kLineDomainCPIndexed:
+        host_shader_type = "control-point-indexed line domain";
+        break;
+      case Shader::HostVertexShaderType::kLineDomainPatchIndexed:
+        host_shader_type = "patch-indexed line domain";
+        break;
+      case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
+        host_shader_type = "control-point-indexed triangle domain";
+        break;
+      case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
+        host_shader_type = "patch-indexed triangle domain";
+        break;
+      case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
+        host_shader_type = "control-point-indexed quad domain";
+        break;
+      case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
+        host_shader_type = "patch-indexed quad domain";
+        break;
+      default:
+        host_shader_type = "vertex";
+    }
+  } else {
+    host_shader_type = "pixel";
+  }
+  XELOGGPU("Generated {} shader ({}b) - hash {:016X}:\n{}\n", host_shader_type,
+           shader->ucode_dword_count() * 4, shader->ucode_data_hash(),
+           shader->ucode_disassembly().c_str());
+
+  // Set up texture and sampler bindings.
+  uint32_t texture_binding_count;
+  const DxbcShaderTranslator::TextureBinding* translator_texture_bindings =
+      translator.GetTextureBindings(texture_binding_count);
   uint32_t sampler_binding_count;
   const DxbcShaderTranslator::SamplerBinding* sampler_bindings =
       translator.GetSamplerBindings(sampler_binding_count);
-  shader->SetTexturesAndSamplers(texture_srvs, texture_srv_count,
-                                 sampler_bindings, sampler_binding_count);
-
-  if (shader->is_valid()) {
-    const char* host_shader_type;
-    if (shader->type() == ShaderType::kVertex) {
-      switch (shader->host_vertex_shader_type()) {
-        case Shader::HostVertexShaderType::kLineDomainCPIndexed:
-          host_shader_type = "control-point-indexed line domain";
-          break;
-        case Shader::HostVertexShaderType::kLineDomainPatchIndexed:
-          host_shader_type = "patch-indexed line domain";
-          break;
-        case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
-          host_shader_type = "control-point-indexed triangle domain";
-          break;
-        case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
-          host_shader_type = "patch-indexed triangle domain";
-          break;
-        case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
-          host_shader_type = "control-point-indexed quad domain";
-          break;
-        case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
-          host_shader_type = "patch-indexed quad domain";
-          break;
-        default:
-          host_shader_type = "vertex";
-      }
-    } else {
-      host_shader_type = "pixel";
-    }
-    XELOGGPU("Generated {} shader ({}b) - hash {:016X}:\n{}\n",
-             host_shader_type, shader->ucode_dword_count() * 4,
-             shader->ucode_data_hash(), shader->ucode_disassembly().c_str());
+  shader->SetTexturesAndSamplers(translator_texture_bindings,
+                                 texture_binding_count, sampler_bindings,
+                                 sampler_binding_count);
+  assert_false(bindless_resources_used_ &&
+               texture_binding_count + sampler_binding_count >
+                   D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 4);
+  // Get hashable texture bindings, without translator-specific info.
+  const D3D12Shader::TextureBinding* texture_bindings =
+      shader->GetTextureBindings(texture_binding_count);
+  size_t texture_binding_layout_bytes =
+      texture_binding_count * sizeof(*texture_bindings);
+  uint64_t texture_binding_layout_hash = 0;
+  if (texture_binding_count) {
+    texture_binding_layout_hash =
+        XXH64(texture_bindings, texture_binding_layout_bytes, 0);
   }
+  uint32_t bindless_sampler_count =
+      bindless_resources_used_ ? sampler_binding_count : 0;
+  uint64_t bindless_sampler_layout_hash = 0;
+  if (bindless_sampler_count) {
+    XXH64_state_t hash_state;
+    XXH64_reset(&hash_state, 0);
+    for (uint32_t i = 0; i < bindless_sampler_count; ++i) {
+      XXH64_update(&hash_state, &sampler_bindings[i].bindless_descriptor_index,
+                   sizeof(sampler_bindings[i].bindless_descriptor_index));
+    }
+    bindless_sampler_layout_hash = XXH64_digest(&hash_state);
+  }
+  // Obtain the unique IDs of binding layouts if there are any texture bindings
+  // or bindless samplers, for invalidation in the command processor.
+  size_t texture_binding_layout_uid = kLayoutUIDEmpty;
+  // Use sampler count for the bindful case because it's the only thing that
+  // must be the same for layouts to be compatible in this case
+  // (instruction-specified parameters are used as overrides for actual
+  // samplers).
+  static_assert(
+      kLayoutUIDEmpty == 0,
+      "Empty layout UID is assumed to be 0 because for bindful samplers, the "
+      "UID is their count");
+  size_t sampler_binding_layout_uid = bindless_resources_used_
+                                          ? kLayoutUIDEmpty
+                                          : size_t(sampler_binding_count);
+  if (texture_binding_count || bindless_sampler_count) {
+    std::lock_guard<std::mutex> layouts_mutex_(layouts_mutex_);
+    if (texture_binding_count) {
+      auto found_range =
+          texture_binding_layout_map_.equal_range(texture_binding_layout_hash);
+      for (auto it = found_range.first; it != found_range.second; ++it) {
+        if (it->second.vector_span_length == texture_binding_count &&
+            !std::memcmp(
+                texture_binding_layouts_.data() + it->second.vector_span_offset,
+                texture_bindings, texture_binding_layout_bytes)) {
+          texture_binding_layout_uid = it->second.uid;
+          break;
+        }
+      }
+      if (texture_binding_layout_uid == kLayoutUIDEmpty) {
+        static_assert(
+            kLayoutUIDEmpty == 0,
+            "Layout UID is size + 1 because it's assumed that 0 is the UID for "
+            "an empty layout");
+        texture_binding_layout_uid = texture_binding_layout_map_.size() + 1;
+        LayoutUID new_uid;
+        new_uid.uid = texture_binding_layout_uid;
+        new_uid.vector_span_offset = texture_binding_layouts_.size();
+        new_uid.vector_span_length = texture_binding_count;
+        texture_binding_layouts_.resize(new_uid.vector_span_offset +
+                                        texture_binding_count);
+        std::memcpy(
+            texture_binding_layouts_.data() + new_uid.vector_span_offset,
+            texture_bindings, texture_binding_layout_bytes);
+        texture_binding_layout_map_.insert(
+            {texture_binding_layout_hash, new_uid});
+      }
+    }
+    if (bindless_sampler_count) {
+      auto found_range =
+          bindless_sampler_layout_map_.equal_range(sampler_binding_layout_uid);
+      for (auto it = found_range.first; it != found_range.second; ++it) {
+        if (it->second.vector_span_length != bindless_sampler_count) {
+          continue;
+        }
+        sampler_binding_layout_uid = it->second.uid;
+        const uint32_t* vector_bindless_sampler_layout =
+            bindless_sampler_layouts_.data() + it->second.vector_span_offset;
+        for (uint32_t i = 0; i < bindless_sampler_count; ++i) {
+          if (vector_bindless_sampler_layout[i] !=
+              sampler_bindings[i].bindless_descriptor_index) {
+            sampler_binding_layout_uid = kLayoutUIDEmpty;
+            break;
+          }
+        }
+        if (sampler_binding_layout_uid != kLayoutUIDEmpty) {
+          break;
+        }
+      }
+      if (sampler_binding_layout_uid == kLayoutUIDEmpty) {
+        sampler_binding_layout_uid = bindless_sampler_layout_map_.size();
+        LayoutUID new_uid;
+        static_assert(
+            kLayoutUIDEmpty == 0,
+            "Layout UID is size + 1 because it's assumed that 0 is the UID for "
+            "an empty layout");
+        new_uid.uid = sampler_binding_layout_uid + 1;
+        new_uid.vector_span_offset = bindless_sampler_layouts_.size();
+        new_uid.vector_span_length = sampler_binding_count;
+        bindless_sampler_layouts_.resize(new_uid.vector_span_offset +
+                                         sampler_binding_count);
+        uint32_t* vector_bindless_sampler_layout =
+            bindless_sampler_layouts_.data() + new_uid.vector_span_offset;
+        for (uint32_t i = 0; i < bindless_sampler_count; ++i) {
+          vector_bindless_sampler_layout[i] =
+              sampler_bindings[i].bindless_descriptor_index;
+        }
+        bindless_sampler_layout_map_.insert(
+            {bindless_sampler_layout_hash, new_uid});
+      }
+    }
+  }
+  shader->SetTextureBindingLayoutUserUID(texture_binding_layout_uid);
+  shader->SetSamplerBindingLayoutUserUID(sampler_binding_layout_uid);
 
   // Create a version of the shader with early depth/stencil forced by Xenia
   // itself when it's safe to do so or when EARLY_Z_ENABLE is set in
   // RB_DEPTHCONTROL.
-  if (shader->type() == ShaderType::kPixel && !edram_rov_used_ &&
+  if (shader->type() == xenos::ShaderType::kPixel && !edram_rov_used_ &&
       !shader->writes_depth()) {
     shader->SetForcedEarlyZShaderObject(
         std::move(DxbcShaderTranslator::ForceEarlyDepthStencil(
@@ -1019,7 +1145,7 @@ bool PipelineCache::TranslateShader(
   // Dump shader files if desired.
   if (!cvars::dump_shaders.empty()) {
     shader->Dump(cvars::dump_shaders,
-                 (shader->type() == ShaderType::kPixel)
+                 (shader->type() == xenos::ShaderType::kPixel)
                      ? (edram_rov_used_ ? "d3d12_rov" : "d3d12_rtv")
                      : "d3d12");
   }
@@ -1029,7 +1155,8 @@ bool PipelineCache::TranslateShader(
 
 bool PipelineCache::GetCurrentStateDescription(
     D3D12Shader* vertex_shader, D3D12Shader* pixel_shader,
-    PrimitiveType primitive_type, IndexFormat index_format, bool early_z,
+    xenos::PrimitiveType primitive_type, xenos::IndexFormat index_format,
+    bool early_z,
     const RenderTargetCache::PipelineRenderTarget render_targets[5],
     PipelineRuntimeDescription& runtime_description_out) {
   PipelineDescription& description_out = runtime_description_out.description;
@@ -1059,7 +1186,7 @@ bool PipelineCache::GetCurrentStateDescription(
   if (pa_su_sc_mode_cntl.multi_prim_ib_ena) {
     // Not using 0xFFFF with 32-bit indices because in index buffers it will be
     // 0xFFFF0000 anyway due to endianness.
-    description_out.strip_cut_index = index_format == IndexFormat::kInt32
+    description_out.strip_cut_index = index_format == xenos::IndexFormat::kInt32
                                           ? PipelineStripCutIndex::kFFFFFFFF
                                           : PipelineStripCutIndex::kFFFF;
   } else {
@@ -1075,16 +1202,16 @@ bool PipelineCache::GetCurrentStateDescription(
   description_out.host_vertex_shader_type = host_vertex_shader_type;
   if (host_vertex_shader_type == Shader::HostVertexShaderType::kVertex) {
     switch (primitive_type) {
-      case PrimitiveType::kPointList:
+      case xenos::PrimitiveType::kPointList:
         description_out.primitive_topology_type_or_tessellation_mode =
             uint32_t(PipelinePrimitiveTopologyType::kPoint);
         break;
-      case PrimitiveType::kLineList:
-      case PrimitiveType::kLineStrip:
-      case PrimitiveType::kLineLoop:
+      case xenos::PrimitiveType::kLineList:
+      case xenos::PrimitiveType::kLineStrip:
+      case xenos::PrimitiveType::kLineLoop:
       // Quads are emulated as line lists with adjacency.
-      case PrimitiveType::kQuadList:
-      case PrimitiveType::k2DLineStrip:
+      case xenos::PrimitiveType::kQuadList:
+      case xenos::PrimitiveType::k2DLineStrip:
         description_out.primitive_topology_type_or_tessellation_mode =
             uint32_t(PipelinePrimitiveTopologyType::kLine);
         break;
@@ -1094,14 +1221,14 @@ bool PipelineCache::GetCurrentStateDescription(
         break;
     }
     switch (primitive_type) {
-      case PrimitiveType::kPointList:
+      case xenos::PrimitiveType::kPointList:
         description_out.geometry_shader = PipelineGeometryShader::kPointList;
         break;
-      case PrimitiveType::kRectangleList:
+      case xenos::PrimitiveType::kRectangleList:
         description_out.geometry_shader =
             PipelineGeometryShader::kRectangleList;
         break;
-      case PrimitiveType::kQuadList:
+      case xenos::PrimitiveType::kQuadList:
         description_out.geometry_shader = PipelineGeometryShader::kQuadList;
         break;
       default:
@@ -1113,7 +1240,7 @@ bool PipelineCache::GetCurrentStateDescription(
         uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode);
   }
 
-  bool primitive_two_faced = IsPrimitiveTwoFaced(
+  bool primitive_two_faced = xenos::IsPrimitiveTwoFaced(
       host_vertex_shader_type != Shader::HostVertexShaderType::kVertex,
       primitive_type);
 
@@ -1204,7 +1331,7 @@ bool PipelineCache::GetCurrentStateDescription(
     // (shadows - 2^17 is not enough, 2^18 hasn't been tested, but 2^19
     // eliminates the acne).
     if (regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
-        DepthRenderTargetFormat::kD24FS8) {
+        xenos::DepthRenderTargetFormat::kD24FS8) {
       poly_offset *= float(1 << 19);
     } else {
       poly_offset *= float(1 << 23);
@@ -1225,8 +1352,8 @@ bool PipelineCache::GetCurrentStateDescription(
   }
   description_out.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
   if (edram_rov_used_) {
-    description_out.rov_msaa =
-        regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != MsaaSamples::k1X;
+    description_out.rov_msaa = regs.Get<reg::RB_SURFACE_INFO>().msaa_samples !=
+                               xenos::MsaaSamples::k1X;
   } else {
     // Depth/stencil. No stencil, always passing depth test and no depth writing
     // means depth disabled.
@@ -1236,7 +1363,7 @@ bool PipelineCache::GetCurrentStateDescription(
         description_out.depth_func = rb_depthcontrol.zfunc;
         description_out.depth_write = rb_depthcontrol.z_write_enable;
       } else {
-        description_out.depth_func = CompareFunction::kAlways;
+        description_out.depth_func = xenos::CompareFunction::kAlways;
       }
       if (rb_depthcontrol.stencil_enable) {
         description_out.stencil_enable = 1;
@@ -1278,13 +1405,13 @@ bool PipelineCache::GetCurrentStateDescription(
         }
       }
       // If not binding the DSV, ignore the format in the hash.
-      if (description_out.depth_func != CompareFunction::kAlways ||
+      if (description_out.depth_func != xenos::CompareFunction::kAlways ||
           description_out.depth_write || description_out.stencil_enable) {
         description_out.depth_format =
             regs.Get<reg::RB_DEPTH_INFO>().depth_format;
       }
     } else {
-      description_out.depth_func = CompareFunction::kAlways;
+      description_out.depth_func = xenos::CompareFunction::kAlways;
     }
     if (early_z) {
       description_out.force_early_z = 1;
@@ -1367,10 +1494,10 @@ bool PipelineCache::GetCurrentStateDescription(
       } else {
         rt.src_blend = PipelineBlendFactor::kOne;
         rt.dest_blend = PipelineBlendFactor::kZero;
-        rt.blend_op = BlendOp::kAdd;
+        rt.blend_op = xenos::BlendOp::kAdd;
         rt.src_blend_alpha = PipelineBlendFactor::kOne;
         rt.dest_blend_alpha = PipelineBlendFactor::kZero;
-        rt.blend_op_alpha = BlendOp::kAdd;
+        rt.blend_op_alpha = xenos::BlendOp::kAdd;
       }
     }
   }
@@ -1597,7 +1724,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12PipelineState(
 
   if (!edram_rov_used_) {
     // Depth/stencil.
-    if (description.depth_func != CompareFunction::kAlways ||
+    if (description.depth_func != xenos::CompareFunction::kAlways ||
         description.depth_write) {
       state_desc.DepthStencilState.DepthEnable = TRUE;
       state_desc.DepthStencilState.DepthWriteMask =
@@ -1684,10 +1811,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12PipelineState(
       // Call of Duty 4 - GPU performance is better when not blending.
       if (rt.src_blend != PipelineBlendFactor::kOne ||
           rt.dest_blend != PipelineBlendFactor::kZero ||
-          rt.blend_op != BlendOp::kAdd ||
+          rt.blend_op != xenos::BlendOp::kAdd ||
           rt.src_blend_alpha != PipelineBlendFactor::kOne ||
           rt.dest_blend_alpha != PipelineBlendFactor::kZero ||
-          rt.blend_op_alpha != BlendOp::kAdd) {
+          rt.blend_op_alpha != xenos::BlendOp::kAdd) {
         blend_desc.BlendEnable = TRUE;
         blend_desc.SrcBlend = kBlendFactorMap[uint32_t(rt.src_blend)];
         blend_desc.DestBlend = kBlendFactorMap[uint32_t(rt.dest_blend)];
@@ -1856,7 +1983,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
     // set the completion event if needed (at the next iteration, or in some
     // other thread).
     {
-      std::unique_lock<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
     }
   }
@@ -1867,7 +1994,7 @@ void PipelineCache::CreateQueuedPipelineStatesOnProcessorThread() {
   while (true) {
     PipelineState* pipeline_state_to_create;
     {
-      std::unique_lock<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
       if (creation_queue_.empty()) {
         break;
       }

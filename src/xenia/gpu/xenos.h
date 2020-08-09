@@ -16,6 +16,7 @@
 
 namespace xe {
 namespace gpu {
+namespace xenos {
 
 enum class ShaderType : uint32_t {
   kVertex = 0,
@@ -53,8 +54,8 @@ enum class PrimitiveType : uint32_t {
   k2DTriStrip = 0x16,
 
   // Tessellation patches when VGT_OUTPUT_PATH_CNTL::path_select is
-  // xenos::VGTOutputPath::kTessellationEnable. The vertex shader receives patch
-  // index rather than control point indices.
+  // VGTOutputPath::kTessellationEnable. The vertex shader receives patch index
+  // rather than control point indices.
   kLinePatch = 0x10,
   kTrianglePatch = 0x11,
   kQuadPatch = 0x12,
@@ -80,9 +81,11 @@ inline bool IsPrimitiveTwoFaced(bool tessellated, PrimitiveType type) {
   return false;
 }
 
-enum class Dimension : uint32_t {
+// For the texture fetch constant (not the tfetch instruction), stacked stored
+// as 2D.
+enum class DataDimension : uint32_t {
   k1D = 0,
-  k2D = 1,
+  k2DOrStacked = 1,
   k3D = 2,
   kCube = 3,
 };
@@ -133,23 +136,23 @@ enum class BorderColor : uint32_t {
   k_ACBCRY_BLACK = 3,
 };
 
-// For the tfetch instruction, not the fetch constant - slightly different
-// meaning, as stacked textures are stored as 2D, but fetched using tfetch3D.
-enum class TextureDimension : uint32_t {
+// For the tfetch instruction (not the fetch constant) and related instructions,
+// stacked accessed using tfetch3D.
+enum class FetchOpDimension : uint32_t {
   k1D = 0,
   k2D = 1,
-  k3D = 2,
+  k3DOrStacked = 2,
   kCube = 3,
 };
 
-inline int GetTextureDimensionComponentCount(TextureDimension dimension) {
+inline int GetFetchOpDimensionComponentCount(FetchOpDimension dimension) {
   switch (dimension) {
-    case TextureDimension::k1D:
+    case FetchOpDimension::k1D:
       return 1;
-    case TextureDimension::k2D:
+    case FetchOpDimension::k2D:
       return 2;
-    case TextureDimension::k3D:
-    case TextureDimension::kCube:
+    case FetchOpDimension::k3DOrStacked:
+    case FetchOpDimension::kCube:
       return 3;
     default:
       assert_unhandled_case(dimension);
@@ -488,8 +491,6 @@ enum class BlendOp : uint32_t {
   kRevSubtract = 4,
 };
 
-namespace xenos {
-
 typedef enum {
   XE_GPU_INVALIDATE_MASK_VERTEX_SHADER = 1 << 8,
   XE_GPU_INVALIDATE_MASK_PIXEL_SHADER = 1 << 9,
@@ -548,11 +549,37 @@ enum class VertexShaderExportMode : uint32_t {
   kMultipass = 7,
 };
 
+constexpr uint32_t kMaxInterpolators = 16;
+
 enum class SampleControl : uint32_t {
   kCentroidsOnly = 0,
   kCentersOnly = 1,
   kCentroidsAndCenters = 2,
 };
+
+// - msaa_samples is RB_SURFACE_INFO::msaa_samples.
+// - sample_control is SQ_CONTEXT_MISC::sc_sample_cntl.
+// - interpolator_control_sampling_pattern is
+//   SQ_INTERPOLATOR_CNTL::sampling_pattern.
+// Centroid interpolation can be tested in Red Dead Redemption. If the GPU host
+// backend implements guest MSAA properly, using host MSAA, with everything
+// interpolated at centers, the Diez Coronas start screen background may have
+// a few distinctly bright pixels on the mesas/buttes, where extrapolation
+// happens. Interpolating certain values (ones that aren't used for gradient
+// calculation, not texture coordinates) at centroids fixes this issue.
+inline uint32_t GetInterpolatorSamplingPattern(
+    MsaaSamples msaa_samples, SampleControl sample_control,
+    uint32_t interpolator_control_sampling_pattern) {
+  if (msaa_samples == MsaaSamples::k1X ||
+      sample_control == SampleControl::kCentersOnly) {
+    return ((1 << kMaxInterpolators) - 1) * uint32_t(SampleLocation::kCenter);
+  }
+  if (sample_control == SampleControl::kCentroidsOnly) {
+    return ((1 << kMaxInterpolators) - 1) * uint32_t(SampleLocation::kCentroid);
+  }
+  assert_true(sample_control == SampleControl::kCentroidsAndCenters);
+  return interpolator_control_sampling_pattern;
+}
 
 enum class VGTOutputPath : uint32_t {
   kVertexReuse = 0,
@@ -697,6 +724,21 @@ XEPACKEDUNION(xe_gpu_vertex_fetch_t, {
   });
 });
 
+// Texture fetch constant size field widths.
+constexpr uint32_t kTexture1DMaxWidthLog2 = 24;
+constexpr uint32_t kTexture1DMaxWidth = uint32_t(1) << kTexture1DMaxWidthLog2;
+constexpr uint32_t kTexture2DCubeMaxWidthHeightLog2 = 13;
+constexpr uint32_t kTexture2DCubeMaxWidthHeight =
+    uint32_t(1) << kTexture2DCubeMaxWidthHeightLog2;
+constexpr uint32_t kTexture2DMaxStackDepthLog2 = 6;
+constexpr uint32_t kTexture2DMaxStackDepth = uint32_t(1)
+                                             << kTexture2DMaxStackDepthLog2;
+constexpr uint32_t kTexture3DMaxWidthHeightLog2 = 11;
+constexpr uint32_t kTexture3DMaxWidthHeight = uint32_t(1)
+                                              << kTexture3DMaxWidthHeightLog2;
+constexpr uint32_t kTexture3DMaxDepthLog2 = 10;
+constexpr uint32_t kTexture3DMaxDepth = uint32_t(1) << kTexture3DMaxDepthLog2;
+
 // XE_GPU_REG_SHADER_CONSTANT_FETCH_*
 XEPACKEDUNION(xe_gpu_texture_fetch_t, {
   XEPACKEDSTRUCTANONYMOUS({
@@ -707,14 +749,14 @@ XEPACKEDUNION(xe_gpu_texture_fetch_t, {
     // which can be texture components 0/1/2/3 or constant 0/1) and R6xx
     // (signedness is FORMAT_COMP_X/Y/Z/W, while the swizzle is DST_SEL_X/Y/Z/W,
     // which is named in resources the same as DST_SEL in fetch clauses).
-    TextureSign sign_x : 2;                                     // +2
-    TextureSign sign_y : 2;                                     // +4
-    TextureSign sign_z : 2;                                     // +6
-    TextureSign sign_w : 2;                                     // +8
-    ClampMode clamp_x : 3;                                      // +10
-    ClampMode clamp_y : 3;                                      // +13
-    ClampMode clamp_z : 3;                                      // +16
-    xenos::SignedRepeatingFractionMode signed_rf_mode_all : 1;  // +19
+    TextureSign sign_x : 2;                              // +2
+    TextureSign sign_y : 2;                              // +4
+    TextureSign sign_z : 2;                              // +6
+    TextureSign sign_w : 2;                              // +8
+    ClampMode clamp_x : 3;                               // +10
+    ClampMode clamp_y : 3;                               // +13
+    ClampMode clamp_z : 3;                               // +16
+    SignedRepeatingFractionMode signed_rf_mode_all : 1;  // +19
     // TODO(Triang3l): 1 or 2 dim_tbd bits?
     uint32_t unk_0 : 2;  // +20
     uint32_t pitch : 9;  // +22 byte_pitch >> 5
@@ -727,6 +769,7 @@ XEPACKEDUNION(xe_gpu_texture_fetch_t, {
     uint32_t nearest_clamp_policy : 1;  // +11 d3d/opengl
     uint32_t base_address : 20;         // +12 base address >> 12
 
+    // Size is stored with 1 subtracted from each component.
     union {  // dword_2
       struct {
         uint32_t width : 24;
@@ -736,8 +779,7 @@ XEPACKEDUNION(xe_gpu_texture_fetch_t, {
         uint32_t width : 13;
         uint32_t height : 13;
         // Should be 0 for k2D and 5 for kCube if not stacked, but not very
-        // meaningful in this case, preferably should be ignored for
-        // non-stacked.
+        // meaningful in this case, likely should be ignored for non-stacked.
         uint32_t stack_depth : 6;
       } size_2d;
       struct {
@@ -749,32 +791,35 @@ XEPACKEDUNION(xe_gpu_texture_fetch_t, {
 
     uint32_t num_format : 1;  // +0 dword_3 frac/int
     // xyzw, 3b each (XE_GPU_SWIZZLE)
-    uint32_t swizzle : 12;                        // +1
-    int32_t exp_adjust : 6;                       // +13
-    TextureFilter mag_filter : 2;                 // +19
-    TextureFilter min_filter : 2;                 // +21
-    TextureFilter mip_filter : 2;                 // +23
-    AnisoFilter aniso_filter : 3;                 // +25
-    xenos::ArbitraryFilter arbitrary_filter : 3;  // +28
-    uint32_t border_size : 1;                     // +31
+    uint32_t swizzle : 12;                 // +1
+    int32_t exp_adjust : 6;                // +13
+    TextureFilter mag_filter : 2;          // +19
+    TextureFilter min_filter : 2;          // +21
+    TextureFilter mip_filter : 2;          // +23
+    AnisoFilter aniso_filter : 3;          // +25
+    ArbitraryFilter arbitrary_filter : 3;  // +28
+    uint32_t border_size : 1;              // +31
 
-    uint32_t vol_mag_filter : 1;    // +0 dword_4
-    uint32_t vol_min_filter : 1;    // +1
-    uint32_t mip_min_level : 4;     // +2
-    uint32_t mip_max_level : 4;     // +6
-    uint32_t mag_aniso_walk : 1;    // +10
-    uint32_t min_aniso_walk : 1;    // +11
-    int32_t lod_bias : 10;          // +12
+    uint32_t vol_mag_filter : 1;  // +0 dword_4
+    uint32_t vol_min_filter : 1;  // +1
+    uint32_t mip_min_level : 4;   // +2
+    uint32_t mip_max_level : 4;   // +6
+    uint32_t mag_aniso_walk : 1;  // +10
+    uint32_t min_aniso_walk : 1;  // +11
+    // 5 fractional bits (A2XX_SQ_TEX_4_LOD_BIAS).
+    int32_t lod_bias : 10;  // +12
+    // Also known as LodBiasH/V in sys2gmem.
     int32_t grad_exp_adjust_h : 5;  // +22
     int32_t grad_exp_adjust_v : 5;  // +27
 
     BorderColor border_color : 2;    // +0 dword_5
     uint32_t force_bc_w_to_max : 1;  // +2
-    uint32_t tri_clamp : 2;          // +3
-    int32_t aniso_bias : 4;          // +5
-    Dimension dimension : 2;         // +9
-    uint32_t packed_mips : 1;        // +11
-    uint32_t mip_address : 20;       // +12 mip address >> 12
+    // Also known as TriJuice.
+    uint32_t tri_clamp : 2;       // +3
+    int32_t aniso_bias : 4;       // +5
+    DataDimension dimension : 2;  // +9
+    uint32_t packed_mips : 1;     // +11
+    uint32_t mip_address : 20;    // +12 mip address >> 12
   });
   XEPACKEDSTRUCTANONYMOUS({
     uint32_t dword_0;
