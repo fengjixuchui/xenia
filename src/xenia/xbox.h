@@ -118,31 +118,35 @@ typedef uint32_t X_HRESULT;
 #define X_E_NO_SUCH_USER                        X_HRESULT_FROM_WIN32(X_ERROR_NO_SUCH_USER)
 
 // MEM_*, used by NtAllocateVirtualMemory
-#define X_MEM_COMMIT              0x00001000
-#define X_MEM_RESERVE             0x00002000
-#define X_MEM_DECOMMIT            0x00004000
-#define X_MEM_RELEASE             0x00008000
-#define X_MEM_FREE                0x00010000
-#define X_MEM_PRIVATE             0x00020000
-#define X_MEM_RESET               0x00080000
-#define X_MEM_TOP_DOWN            0x00100000
-#define X_MEM_NOZERO              0x00800000
-#define X_MEM_LARGE_PAGES         0x20000000
-#define X_MEM_HEAP                0x40000000
-#define X_MEM_16MB_PAGES          0x80000000  // from Valve SDK
+enum X_MEM : uint32_t {
+  X_MEM_COMMIT      = 0x00001000,
+  X_MEM_RESERVE     = 0x00002000,
+  X_MEM_DECOMMIT    = 0x00004000,
+  X_MEM_RELEASE     = 0x00008000,
+  X_MEM_FREE        = 0x00010000,
+  X_MEM_PRIVATE     = 0x00020000,
+  X_MEM_RESET       = 0x00080000,
+  X_MEM_TOP_DOWN    = 0x00100000,
+  X_MEM_NOZERO      = 0x00800000,
+  X_MEM_LARGE_PAGES = 0x20000000,
+  X_MEM_HEAP        = 0x40000000,
+  X_MEM_16MB_PAGES  = 0x80000000  // from Valve SDK
+};
 
 // PAGE_*, used by NtAllocateVirtualMemory
-#define X_PAGE_NOACCESS           0x00000001
-#define X_PAGE_READONLY           0x00000002
-#define X_PAGE_READWRITE          0x00000004
-#define X_PAGE_WRITECOPY          0x00000008
-#define X_PAGE_EXECUTE            0x00000010
-#define X_PAGE_EXECUTE_READ       0x00000020
-#define X_PAGE_EXECUTE_READWRITE  0x00000040
-#define X_PAGE_EXECUTE_WRITECOPY  0x00000080
-#define X_PAGE_GUARD              0x00000100
-#define X_PAGE_NOCACHE            0x00000200
-#define X_PAGE_WRITECOMBINE       0x00000400
+enum X_PAGE : uint32_t {
+  X_PAGE_NOACCESS          = 0x00000001,
+  X_PAGE_READONLY          = 0x00000002,
+  X_PAGE_READWRITE         = 0x00000004,
+  X_PAGE_WRITECOPY         = 0x00000008,
+  X_PAGE_EXECUTE           = 0x00000010,
+  X_PAGE_EXECUTE_READ      = 0x00000020,
+  X_PAGE_EXECUTE_READWRITE = 0x00000040,
+  X_PAGE_EXECUTE_WRITECOPY = 0x00000080,
+  X_PAGE_GUARD             = 0x00000100,
+  X_PAGE_NOCACHE           = 0x00000200,
+  X_PAGE_WRITECOMBINE      = 0x00000400
+};
 
 // Sockets/networking.
 #define X_INVALID_SOCKET (uint32_t)(~0)

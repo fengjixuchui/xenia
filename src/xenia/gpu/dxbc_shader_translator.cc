@@ -728,12 +728,12 @@ void DxbcShaderTranslator::StartPixelShader() {
         // it will be sampled with higher resolution too.
         // Check if resolution scale is 2x2 and multiply by 0.5 in this case.
         system_constants_used_ |= 1ull
-                                  << kSysConst_EDRAMResolutionSquareScale_Index;
+                                  << kSysConst_EdramResolutionSquareScale_Index;
         DxbcOpIEq(DxbcDest::R(param_gen_temp, 0b0100),
                   DxbcSrc::CB(cbuffer_index_system_constants_,
                               uint32_t(CbufferRegister::kSystemConstants),
-                              kSysConst_EDRAMResolutionSquareScale_Vec)
-                      .Select(kSysConst_EDRAMResolutionSquareScale_Comp),
+                              kSysConst_EdramResolutionSquareScale_Vec)
+                      .Select(kSysConst_EdramResolutionSquareScale_Comp),
                   DxbcSrc::LU(4));
         DxbcOpIf(true, DxbcSrc::R(param_gen_temp, DxbcSrc::kZZZZ));
         {
@@ -870,20 +870,12 @@ void DxbcShaderTranslator::StartPixelShader() {
 void DxbcShaderTranslator::StartTranslation() {
   // Allocate labels and registers for subroutines.
   label_rov_depth_stencil_sample_ = UINT32_MAX;
-  std::memset(label_rov_color_sample_, 0xFF, sizeof(label_rov_color_sample_));
   uint32_t label_index = 0;
   system_temps_subroutine_count_ = 0;
   if (IsDxbcPixelShader() && edram_rov_used_) {
     label_rov_depth_stencil_sample_ = label_index++;
     system_temps_subroutine_count_ =
         std::max((uint32_t)2, system_temps_subroutine_count_);
-    for (uint32_t i = 0; i < xe::countof(label_rov_color_sample_); ++i) {
-      if (writes_color_target(i)) {
-        label_rov_color_sample_[i] = label_index++;
-        system_temps_subroutine_count_ =
-            std::max((uint32_t)4, system_temps_subroutine_count_);
-      }
-    }
   }
   system_temps_subroutine_ = PushSystemTemp(0, system_temps_subroutine_count_);
 
@@ -1212,11 +1204,6 @@ void DxbcShaderTranslator::CompleteShaderCode() {
   // register allocation).
   if (label_rov_depth_stencil_sample_ != UINT32_MAX) {
     CompleteShaderCode_ROV_DepthStencilSampleSubroutine();
-  }
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (label_rov_color_sample_[i] != UINT32_MAX) {
-      CompleteShaderCode_ROV_ColorSampleSubroutine(i);
-    }
   }
 
   if (IsDxbcVertexOrDomainShader()) {
@@ -2684,7 +2671,7 @@ void DxbcShaderTranslator::WriteResourceDefinitions() {
       shader_object_.push_back(uint32_t(DxbcRdefDimension::kUAVBuffer));
       // Not multisampled.
       shader_object_.push_back(0xFFFFFFFFu);
-      shader_object_.push_back(uint32_t(UAVRegister::kEDRAM));
+      shader_object_.push_back(uint32_t(UAVRegister::kEdram));
       // One binding.
       shader_object_.push_back(1);
       // No DxbcRdefInputFlags.
@@ -3587,8 +3574,8 @@ void DxbcShaderTranslator::WriteShaderCode() {
       shader_object_.push_back(EncodeVectorSwizzledOperand(
           D3D11_SB_OPERAND_TYPE_UNORDERED_ACCESS_VIEW, kSwizzleXYZW, 3));
       shader_object_.push_back(uav_index_edram_);
-      shader_object_.push_back(uint32_t(UAVRegister::kEDRAM));
-      shader_object_.push_back(uint32_t(UAVRegister::kEDRAM));
+      shader_object_.push_back(uint32_t(UAVRegister::kEdram));
+      shader_object_.push_back(uint32_t(UAVRegister::kEdram));
       shader_object_.push_back(
           ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_UINT, 0) |
           ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_UINT, 1) |
