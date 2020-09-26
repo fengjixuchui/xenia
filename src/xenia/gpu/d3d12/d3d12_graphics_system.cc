@@ -10,7 +10,9 @@
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include "xenia/gpu/draw_util.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 #include "xenia/xbox.h"
 
@@ -96,7 +98,7 @@ X_STATUS D3D12GraphicsSystem::Setup(cpu::Processor* processor,
   stretch_root_desc.Flags =
       D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS;
   stretch_root_signature_ =
-      ui::d3d12::util::CreateRootSignature(d3d12_provider, stretch_root_desc);
+      ui::d3d12::util::CreateRootSignature(*d3d12_provider, stretch_root_desc);
   if (stretch_root_signature_ == nullptr) {
     XELOGE("Failed to create the front buffer stretch root signature");
     return X_STATUS_UNSUCCESSFUL;
@@ -123,7 +125,7 @@ X_STATUS D3D12GraphicsSystem::Setup(cpu::Processor* processor,
   stretch_root_desc.NumParameters = 3;
   stretch_root_desc.pParameters = stretch_root_parameters;
   stretch_gamma_root_signature_ =
-      ui::d3d12::util::CreateRootSignature(d3d12_provider, stretch_root_desc);
+      ui::d3d12::util::CreateRootSignature(*d3d12_provider, stretch_root_desc);
   if (stretch_gamma_root_signature_ == nullptr) {
     XELOGE(
         "Failed to create the gamma-correcting front buffer stretch root "
@@ -140,6 +142,7 @@ X_STATUS D3D12GraphicsSystem::Setup(cpu::Processor* processor,
   stretch_pipeline_desc.VS.BytecodeLength = sizeof(fullscreen_vs);
   stretch_pipeline_desc.PS.pShaderBytecode = stretch_ps;
   stretch_pipeline_desc.PS.BytecodeLength = sizeof(stretch_ps);
+  // The shader will set alpha to 1, don't use output-merger to preserve it.
   stretch_pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
       D3D12_COLOR_WRITE_ENABLE_ALL;
   stretch_pipeline_desc.SampleMask = UINT_MAX;
@@ -265,22 +268,39 @@ void D3D12GraphicsSystem::Swap(xe::ui::UIEvent* e) {
     return;
   }
 
+  uint32_t window_width, window_height;
+  display_context_->GetSwapChainSize(window_width, window_height);
+
+  int32_t target_x, target_y;
+  uint32_t target_width, target_height;
+  draw_util::GetPresentArea(swap_state.width, swap_state.height, window_width,
+                            window_height, target_x, target_y, target_width,
+                            target_height);
+  // For safety.
+  target_x = clamp(target_x, int32_t(D3D12_VIEWPORT_BOUNDS_MIN),
+                   int32_t(D3D12_VIEWPORT_BOUNDS_MAX));
+  target_y = clamp(target_y, int32_t(D3D12_VIEWPORT_BOUNDS_MIN),
+                   int32_t(D3D12_VIEWPORT_BOUNDS_MAX));
+  target_width = std::min(
+      target_width, uint32_t(int32_t(D3D12_VIEWPORT_BOUNDS_MAX) - target_x));
+  target_height = std::min(
+      target_height, uint32_t(int32_t(D3D12_VIEWPORT_BOUNDS_MAX) - target_y));
+
   auto command_list = display_context_->GetSwapCommandList();
-  uint32_t swap_width, swap_height;
-  display_context_->GetSwapChainSize(swap_width, swap_height);
+  // Assuming the window has already been cleared to the needed letterbox color.
   D3D12_VIEWPORT viewport;
-  viewport.TopLeftX = 0.0f;
-  viewport.TopLeftY = 0.0f;
-  viewport.Width = float(swap_width);
-  viewport.Height = float(swap_height);
+  viewport.TopLeftX = float(target_x);
+  viewport.TopLeftY = float(target_y);
+  viewport.Width = float(target_width);
+  viewport.Height = float(target_height);
   viewport.MinDepth = 0.0f;
   viewport.MaxDepth = 0.0f;
   command_list->RSSetViewports(1, &viewport);
   D3D12_RECT scissor;
   scissor.left = 0;
   scissor.top = 0;
-  scissor.right = swap_width;
-  scissor.bottom = swap_height;
+  scissor.right = window_width;
+  scissor.bottom = window_height;
   command_list->RSSetScissorRects(1, &scissor);
   command_list->SetDescriptorHeaps(1, &swap_srv_heap);
   StretchTextureToFrontBuffer(

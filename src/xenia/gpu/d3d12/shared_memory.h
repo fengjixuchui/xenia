@@ -18,7 +18,7 @@
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/memory.h"
 #include "xenia/ui/d3d12/d3d12_api.h"
-#include "xenia/ui/d3d12/pools.h"
+#include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 
 namespace xe {
 namespace gpu {
@@ -31,8 +31,8 @@ class D3D12CommandProcessor;
 // system page size granularity.
 class SharedMemory {
  public:
-  SharedMemory(D3D12CommandProcessor* command_processor, Memory* memory,
-               TraceWriter* trace_writer);
+  SharedMemory(D3D12CommandProcessor& command_processor, Memory& memory,
+               TraceWriter& trace_writer);
   ~SharedMemory();
 
   bool Initialize();
@@ -85,10 +85,6 @@ class SharedMemory {
   // Unregisters previously registered watched memory range.
   void UnwatchMemoryRange(WatchHandle handle);
 
-  // Ensures the buffer tiles backing the range are resident, but doesn't upload
-  // anything.
-  bool EnsureTilesResident(uint32_t start, uint32_t length);
-
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the buffer tiles backing the range are resident. May transition the
   // tiled buffer to copy destination - call this before UseForReading or
@@ -106,7 +102,10 @@ class SharedMemory {
   // Marks the range as containing GPU-generated data (such as resolves),
   // triggering modification callbacks, making it valid (so pages are not
   // copied from the main memory until they're modified by the CPU) and
-  // protecting it.
+  // protecting it. Before writing anything from the GPU side, RequestRange must
+  // be called, to make sure, if the GPU writes don't overwrite *everything* in
+  // the pages they touch, the CPU data is properly loaded to the unmodified
+  // regions in those pages.
   void RangeWrittenByGPU(uint32_t start, uint32_t length);
 
   // Makes the buffer usable for vertices, indices and texture untiling.
@@ -154,9 +153,9 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
-  D3D12CommandProcessor* command_processor_;
-  Memory* memory_;
-  TraceWriter* trace_writer_;
+  D3D12CommandProcessor& command_processor_;
+  Memory& memory_;
+  TraceWriter& trace_writer_;
 
   // The 512 MB tiled buffer.
   static constexpr uint32_t kBufferSizeLog2 = 29;
@@ -185,6 +184,10 @@ class SharedMemory {
   // Total buffer page count.
   uint32_t page_count_;
 
+  // Ensures the buffer tiles backing the range are resident, but doesn't upload
+  // anything.
+  bool EnsureTilesResident(uint32_t start, uint32_t length);
+
   // Non-shader-visible buffer descriptor heap for faster binding (via copying
   // rather than creation).
   enum class BufferDescriptorIndex : uint32_t {
@@ -209,7 +212,7 @@ class SharedMemory {
   std::vector<UploadRange> upload_ranges_;
   void GetRangesToUpload(uint32_t request_page_first,
                          uint32_t request_page_last);
-  std::unique_ptr<ui::d3d12::UploadBufferPool> upload_buffer_pool_ = nullptr;
+  std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> upload_buffer_pool_;
 
   // GPU-written memory downloading for traces.
   // Start page, length in pages.

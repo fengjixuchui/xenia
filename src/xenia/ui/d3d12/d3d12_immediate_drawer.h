@@ -15,7 +15,8 @@
 #include <vector>
 
 #include "xenia/ui/d3d12/d3d12_api.h"
-#include "xenia/ui/d3d12/pools.h"
+#include "xenia/ui/d3d12/d3d12_descriptor_heap_pool.h"
+#include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/immediate_drawer.h"
 
 namespace xe {
@@ -26,7 +27,7 @@ class D3D12Context;
 
 class D3D12ImmediateDrawer : public ImmediateDrawer {
  public:
-  D3D12ImmediateDrawer(D3D12Context* graphics_context);
+  D3D12ImmediateDrawer(D3D12Context& graphics_context);
   ~D3D12ImmediateDrawer() override;
 
   bool Initialize();
@@ -37,7 +38,6 @@ class D3D12ImmediateDrawer : public ImmediateDrawer {
                                                   ImmediateTextureFilter filter,
                                                   bool repeat,
                                                   const uint8_t* data) override;
-  void UpdateTexture(ImmediateTexture* texture, const uint8_t* data) override;
 
   void Begin(int render_target_width, int render_target_height) override;
   void BeginDrawBatch(const ImmediateDrawBatch& batch) override;
@@ -46,20 +46,39 @@ class D3D12ImmediateDrawer : public ImmediateDrawer {
   void End() override;
 
  private:
-  D3D12Context* context_ = nullptr;
+  class D3D12ImmediateTexture : public ImmediateTexture {
+   public:
+    static constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12ImmediateTexture(uint32_t width, uint32_t height,
+                          ID3D12Resource* resource_if_exists,
+                          ImmediateTextureFilter filter, bool is_repeated);
+    ~D3D12ImmediateTexture() override;
+    ID3D12Resource* resource() const { return resource_; }
+    ImmediateTextureFilter filter() const { return filter_; }
+    bool is_repeated() const { return is_repeated_; }
+
+   private:
+    ID3D12Resource* resource_;
+    ImmediateTextureFilter filter_;
+    bool is_repeated_;
+  };
+
+  void UploadTextures();
+
+  D3D12Context& context_;
 
   ID3D12RootSignature* root_signature_ = nullptr;
   enum class RootParameter {
     kRestrictTextureSamples,
     kTexture,
     kSampler,
-    kViewportInvSize,
+    kViewportSizeInv,
 
     kCount
   };
 
-  ID3D12PipelineState* pipeline_triangle_ = nullptr;
-  ID3D12PipelineState* pipeline_line_ = nullptr;
+  ID3D12PipelineState* pipeline_state_triangle_ = nullptr;
+  ID3D12PipelineState* pipeline_state_line_ = nullptr;
 
   enum class SamplerIndex {
     kNearestClamp,
@@ -74,17 +93,17 @@ class D3D12ImmediateDrawer : public ImmediateDrawer {
   D3D12_CPU_DESCRIPTOR_HANDLE sampler_heap_cpu_start_;
   D3D12_GPU_DESCRIPTOR_HANDLE sampler_heap_gpu_start_;
 
-  std::unique_ptr<UploadBufferPool> vertex_buffer_pool_ = nullptr;
-  std::unique_ptr<DescriptorHeapPool> texture_descriptor_pool_ = nullptr;
-  uint64_t texture_descriptor_pool_heap_index_;
+  std::unique_ptr<D3D12UploadBufferPool> vertex_buffer_pool_;
+  std::unique_ptr<D3D12DescriptorHeapPool> texture_descriptor_pool_;
 
   struct PendingTextureUpload {
-    ImmediateTexture* texture;
+    ID3D12Resource* texture;
     ID3D12Resource* buffer;
   };
   std::vector<PendingTextureUpload> texture_uploads_pending_;
 
   struct SubmittedTextureUpload {
+    ID3D12Resource* texture;
     ID3D12Resource* buffer;
     uint64_t fence_value;
   };
@@ -94,8 +113,10 @@ class D3D12ImmediateDrawer : public ImmediateDrawer {
   int current_render_target_width_, current_render_target_height_;
   bool batch_open_ = false;
   bool batch_has_index_buffer_;
+  D3D12_RECT current_scissor_;
   D3D_PRIMITIVE_TOPOLOGY current_primitive_topology_;
-  ImmediateTexture* current_texture_;
+  ID3D12Resource* current_texture_;
+  uint64_t current_texture_descriptor_heap_index_;
   SamplerIndex current_sampler_index_;
 };
 

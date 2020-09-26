@@ -383,6 +383,14 @@ bool D3D12Provider::Initialize() {
       device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
   // Check if optional features are supported.
+  // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED requires Windows 10 2004 (indicated by
+  // the availability of ID3D12Device8 or D3D12_FEATURE_D3D12_OPTIONS7).
+  heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_NONE;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7;
+  if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7,
+                                            &options7, sizeof(options7)))) {
+    heap_flag_create_not_zeroed_ = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+  }
   rasterizer_ordered_views_supported_ = false;
   resource_binding_tier_ = D3D12_RESOURCE_BINDING_TIER_1;
   tiled_resources_tier_ = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
@@ -410,13 +418,16 @@ bool D3D12Provider::Initialize() {
         virtual_address_support.MaxGPUVirtualAddressBitsPerResource;
   }
   XELOGD3D(
-      "Direct3D 12 device features:\n"
-      "Max GPU virtual address bits per resource: {}\n"
-      "Programmable sample positions: tier {}\n"
-      "Rasterizer-ordered views: {}\n"
-      "Resource binding: tier {}\n"
-      "Tiled resources: tier {}\n",
+      "Direct3D 12 device and OS features:\n"
+      "* Max GPU virtual address bits per resource: {}\n"
+      "* Non-zeroed heap creation: {}\n"
+      "* Programmable sample positions: tier {}\n"
+      "* Rasterizer-ordered views: {}\n"
+      "* Resource binding: tier {}\n"
+      "* Tiled resources: tier {}\n",
       virtual_address_bits_per_resource_,
+      (heap_flag_create_not_zeroed_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) ? "yes"
+                                                                         : "no",
       uint32_t(programmable_sample_positions_tier_),
       rasterizer_ordered_views_supported_ ? "yes" : "no",
       uint32_t(resource_binding_tier_), uint32_t(tiled_resources_tier_));

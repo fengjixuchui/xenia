@@ -29,8 +29,9 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/d3d12/d3d12_context.h"
+#include "xenia/ui/d3d12/d3d12_descriptor_heap_pool.h"
+#include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
-#include "xenia/ui/d3d12/pools.h"
 
 namespace xe {
 namespace gpu {
@@ -54,14 +55,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   void RestoreEdramSnapshot(const void* snapshot) override;
 
   // Needed by everything that owns transient objects.
-  ui::d3d12::D3D12Context* GetD3D12Context() const {
-    return static_cast<ui::d3d12::D3D12Context*>(context_.get());
+  ui::d3d12::D3D12Context& GetD3D12Context() const {
+    return static_cast<ui::d3d12::D3D12Context&>(*context_);
   }
 
   // Returns the deferred drawing command list for the currently open
   // submission.
-  DeferredCommandList* GetDeferredCommandList() {
-    return deferred_command_list_.get();
+  DeferredCommandList& GetDeferredCommandList() {
+    return *deferred_command_list_;
   }
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
@@ -93,8 +94,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12RootSignature* GetRootSignature(const D3D12Shader* vertex_shader,
                                         const D3D12Shader* pixel_shader);
 
-  ui::d3d12::UploadBufferPool* GetConstantBufferPool() const {
-    return constant_buffer_pool_.get();
+  ui::d3d12::D3D12UploadBufferPool& GetConstantBufferPool() const {
+    return *constant_buffer_pool_;
   }
 
   D3D12_CPU_DESCRIPTOR_HANDLE GetViewBindlessHeapCPUStart() const {
@@ -311,8 +312,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void ClearCommandAllocatorCache();
 
   // Request descriptors and automatically rebind the descriptor heap on the
-  // draw command list. Refer to DescriptorHeapPool::Request for partial/full
-  // update explanation. Doesn't work when bindless descriptors are used.
+  // draw command list. Refer to D3D12DescriptorHeapPool::Request for partial /
+  // full update explanation. Doesn't work when bindless descriptors are used.
   uint64_t RequestViewBindfulDescriptors(
       uint64_t previous_heap_index, uint32_t count_for_partial_update,
       uint32_t count_for_full_update,
@@ -375,7 +376,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   CommandAllocator* command_allocator_submitted_last_ = nullptr;
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
-  std::unique_ptr<DeferredCommandList> deferred_command_list_ = nullptr;
+  std::unique_ptr<DeferredCommandList> deferred_command_list_;
 
   // Should bindless textures and samplers be used - many times faster
   // UpdateBindings than bindful (that becomes a significant bottleneck with
@@ -387,13 +388,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // targets.
   bool edram_rov_used_ = false;
 
-  std::unique_ptr<ui::d3d12::UploadBufferPool> constant_buffer_pool_ = nullptr;
+  std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
   static constexpr uint32_t kViewBindfulHeapSize = 32768;
   static_assert(kViewBindfulHeapSize <=
                 D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1);
-  std::unique_ptr<ui::d3d12::DescriptorHeapPool> view_bindful_heap_pool_ =
-      nullptr;
+  std::unique_ptr<ui::d3d12::D3D12DescriptorHeapPool> view_bindful_heap_pool_;
   // Currently bound descriptor heap - updated by RequestViewBindfulDescriptors.
   ID3D12DescriptorHeap* view_bindful_heap_current_;
   // Rationale: textures have 4 KB alignment in guest memory, and there can be
@@ -423,8 +423,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // FIXME(Triang3l): Investigate the issue with the sampler 2047 on Nvidia.
   static constexpr uint32_t kSamplerHeapSize = 2000;
   static_assert(kSamplerHeapSize <= D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE);
-  std::unique_ptr<ui::d3d12::DescriptorHeapPool> sampler_bindful_heap_pool_ =
-      nullptr;
+  std::unique_ptr<ui::d3d12::D3D12DescriptorHeapPool>
+      sampler_bindful_heap_pool_;
   ID3D12DescriptorHeap* sampler_bindful_heap_current_;
   ID3D12DescriptorHeap* sampler_bindless_heap_current_ = nullptr;
   D3D12_CPU_DESCRIPTOR_HANDLE sampler_bindless_heap_cpu_start_;
@@ -450,15 +450,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
   ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
 
-  std::unique_ptr<SharedMemory> shared_memory_ = nullptr;
+  std::unique_ptr<SharedMemory> shared_memory_;
 
-  std::unique_ptr<PipelineCache> pipeline_cache_ = nullptr;
+  std::unique_ptr<PipelineCache> pipeline_cache_;
 
-  std::unique_ptr<TextureCache> texture_cache_ = nullptr;
+  std::unique_ptr<TextureCache> texture_cache_;
 
-  std::unique_ptr<RenderTargetCache> render_target_cache_ = nullptr;
+  std::unique_ptr<RenderTargetCache> render_target_cache_;
 
-  std::unique_ptr<PrimitiveConverter> primitive_converter_ = nullptr;
+  std::unique_ptr<PrimitiveConverter> primitive_converter_;
 
   // Mip 0 contains the normal gamma ramp (256 entries), mip 1 contains the PWL
   // ramp (128 entries). DXGI_FORMAT_R10G10B10A2_UNORM 1D.

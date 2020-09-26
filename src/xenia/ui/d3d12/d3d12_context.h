@@ -28,22 +28,19 @@ class D3D12Context : public GraphicsContext {
 
   ImmediateDrawer* immediate_drawer() override;
 
-  bool is_current() override;
-  bool MakeCurrent() override;
-  void ClearCurrent() override;
+  bool WasLost() override;
 
-  bool WasLost() override { return context_lost_; }
-
-  void BeginSwap() override;
+  bool BeginSwap() override;
   void EndSwap() override;
 
   std::unique_ptr<RawImage> Capture() override;
 
-  D3D12Provider* GetD3D12Provider() const {
-    return static_cast<D3D12Provider*>(provider_);
+  D3D12Provider& GetD3D12Provider() const {
+    return static_cast<D3D12Provider&>(*provider_);
   }
 
-  static constexpr DXGI_FORMAT kSwapChainFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  // The format used by DWM.
+  static constexpr DXGI_FORMAT kSwapChainFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
   ID3D12Resource* GetSwapChainBuffer(uint32_t buffer_index) const {
     return swap_chain_buffers_[buffer_index];
   }
@@ -72,11 +69,10 @@ class D3D12Context : public GraphicsContext {
 
  private:
   friend class D3D12Provider;
-
   explicit D3D12Context(D3D12Provider* provider, Window* target_window);
+  bool Initialize();
 
  private:
-  bool Initialize();
   bool InitializeSwapChainBuffers();
   void Shutdown();
 
@@ -103,7 +99,7 @@ class D3D12Context : public GraphicsContext {
   //     kSwapCommandAllocatorCount.
   ID3D12GraphicsCommandList* swap_command_list_ = nullptr;
 
-  std::unique_ptr<D3D12ImmediateDrawer> immediate_drawer_ = nullptr;
+  std::unique_ptr<D3D12ImmediateDrawer> immediate_drawer_;
 };
 
 }  // namespace d3d12

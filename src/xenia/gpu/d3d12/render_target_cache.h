@@ -23,7 +23,7 @@
 #include "xenia/gpu/xenos.h"
 #include "xenia/memory.h"
 #include "xenia/ui/d3d12/d3d12_api.h"
-#include "xenia/ui/d3d12/pools.h"
+#include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 
 DECLARE_bool(d3d12_16bit_rtv_full_range);
 
@@ -250,12 +250,13 @@ class RenderTargetCache {
     DXGI_FORMAT format;
   };
 
-  RenderTargetCache(D3D12CommandProcessor* command_processor,
-                    RegisterFile* register_file, TraceWriter* trace_writer,
-                    bool bindless_resources_used, bool edram_rov_used);
+  RenderTargetCache(D3D12CommandProcessor& command_processor,
+                    const RegisterFile& register_file,
+                    TraceWriter& trace_writer, bool bindless_resources_used,
+                    bool edram_rov_used);
   ~RenderTargetCache();
 
-  bool Initialize(const TextureCache* texture_cache);
+  bool Initialize(const TextureCache& texture_cache);
   void Shutdown();
   void ClearCache();
 
@@ -483,9 +484,9 @@ class RenderTargetCache {
                                            DXGI_FORMAT format);
 #endif
 
-  D3D12CommandProcessor* command_processor_;
-  RegisterFile* register_file_;
-  TraceWriter* trace_writer_;
+  D3D12CommandProcessor& command_processor_;
+  const RegisterFile& register_file_;
+  TraceWriter& trace_writer_;
   bool bindless_resources_used_;
   bool edram_rov_used_;
 
@@ -601,8 +602,8 @@ class RenderTargetCache {
 
   // For traces only.
   ID3D12Resource* edram_snapshot_download_buffer_ = nullptr;
-  std::unique_ptr<ui::d3d12::UploadBufferPool> edram_snapshot_restore_pool_ =
-      nullptr;
+  std::unique_ptr<ui::d3d12::D3D12UploadBufferPool>
+      edram_snapshot_restore_pool_;
 };
 
 }  // namespace d3d12
