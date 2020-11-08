@@ -17,13 +17,14 @@
 #include <unordered_map>
 #include <utility>
 
+#include "xenia/base/assert.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
+#include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
 #include "xenia/gpu/d3d12/pipeline_cache.h"
 #include "xenia/gpu/d3d12/primitive_converter.h"
 #include "xenia/gpu/d3d12/render_target_cache.h"
-#include "xenia/gpu/d3d12/shared_memory.h"
 #include "xenia/gpu/d3d12/texture_cache.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/xenos.h"
@@ -54,7 +55,6 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void RestoreEdramSnapshot(const void* snapshot) override;
 
-  // Needed by everything that owns transient objects.
   ui::d3d12::D3D12Context& GetD3D12Context() const {
     return static_cast<ui::d3d12::D3D12Context&>(*context_);
   }
@@ -62,11 +62,19 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandList& GetDeferredCommandList() {
-    return *deferred_command_list_;
+    assert_true(submission_open_);
+    return deferred_command_list_;
   }
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+
+  // Must be called when a subsystem does something like UpdateTileMappings so
+  // it can be awaited in CheckSubmissionFence(submission_current_) if it was
+  // done after the latest ExecuteCommandLists + Signal.
+  void NotifyQueueOperationsDoneDirectly() {
+    queue_operations_done_since_submission_signal_ = true;
+  }
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
@@ -106,20 +114,23 @@ class D3D12CommandProcessor : public CommandProcessor {
     assert_true(bindless_resources_used_);
     return view_bindless_heap_gpu_start_;
   }
-  // Returns UINT32_MAX if no free descriptors.
+  // Returns UINT32_MAX if no free descriptors. If the unbounded SRV range for
+  // bindless resources is also used in the root signature of the draw /
+  // dispatch referencing this descriptor, this must only be used to allocate
+  // SRVs, otherwise it won't work on Nvidia Fermi (root signature creation will
+  // fail)!
   uint32_t RequestPersistentViewBindlessDescriptor();
   void ReleaseViewBindlessDescriptorImmediately(uint32_t descriptor_index);
-  // Request non-contiguous SRV/UAV descriptors for use only within the next
+  // Request non-contiguous CBV/SRV/UAV descriptors for use only within the next
   // draw or dispatch command done for internal purposes. May change the current
-  // descriptor heap.
+  // descriptor heap. If the unbounded SRV range for bindless resources is also
+  // used in the root signature of the draw / dispatch referencing these
+  // descriptors, this must only be used to allocate SRVs, otherwise it won't
+  // work on Nvidia Fermi (root signature creation will fail)!
   bool RequestOneUseSingleViewDescriptors(
       uint32_t count, ui::d3d12::util::DescriptorCPUGPUHandlePair* handles_out);
   // These are needed often, so they are always allocated.
   enum class SystemBindlessView : uint32_t {
-    kNullTexture2DArray,
-    kNullTexture3D,
-    kNullTextureCube,
-
     kSharedMemoryRawSRV,
     kSharedMemoryR32UintSRV,
     kSharedMemoryR32G32UintSRV,
@@ -139,6 +150,14 @@ class D3D12CommandProcessor : public CommandProcessor {
 
     kGammaRampNormalSRV,
     kGammaRampPWLSRV,
+
+    // Beyond this point, SRVs are accessible to shaders through an unbounded
+    // range - no descriptors of other types bound to shaders alongside
+    // unbounded ranges - must be located beyond this point.
+    kUnboundedSRVsStart,
+    kNullTexture2DArray = kUnboundedSRVsStart,
+    kNullTexture3D,
+    kNullTextureCube,
 
     kCount,
   };
@@ -208,7 +227,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueCopy() override;
 
   void InitializeTrace() override;
-  void FinalizeTrace() override;
 
  private:
   static constexpr uint32_t kQueueFrames = 3;
@@ -292,7 +310,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // submission has already been closed.
 
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
-  // the submission to await to simply check status.
+  // the submission to await to simply check status, or pass submission_current_
+  // to wait for all queue operations to be completed.
   void CheckSubmissionFence(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
@@ -307,7 +326,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // as when there are unfinished graphics pipeline state creation requests that
   // would need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
-  void AwaitAllSubmissionsCompletion();
+  bool AwaitAllQueueOperationsCompletion() {
+    CheckSubmissionFence(submission_current_);
+    return submission_completed_ + 1 >= submission_current_;
+  }
   // Need to await submission completion before calling.
   void ClearCommandAllocatorCache();
 
@@ -350,12 +372,21 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   bool cache_clear_requested_ = false;
 
+  HANDLE fence_completion_event_ = nullptr;
+
   bool submission_open_ = false;
   // Values of submission_fence_.
   uint64_t submission_current_ = 1;
   uint64_t submission_completed_ = 0;
-  HANDLE submission_fence_completion_event_ = nullptr;
   ID3D12Fence* submission_fence_ = nullptr;
+
+  // For awaiting non-submission queue operations such as UpdateTileMappings in
+  // AwaitAllQueueOperationsCompletion when they're queued after the latest
+  // ExecuteCommandLists + Signal, thus won't be awaited by just awaiting the
+  // submission.
+  ID3D12Fence* queue_operations_since_submission_fence_ = nullptr;
+  uint64_t queue_operations_since_submission_fence_last_ = 0;
+  bool queue_operations_done_since_submission_signal_ = false;
 
   bool frame_open_ = false;
   // Guest frame index, since some transient resources can be reused across
@@ -376,7 +407,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   CommandAllocator* command_allocator_submitted_last_ = nullptr;
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
-  std::unique_ptr<DeferredCommandList> deferred_command_list_;
+  DeferredCommandList deferred_command_list_;
 
   // Should bindless textures and samplers be used - many times faster
   // UpdateBindings than bindful (that becomes a significant bottleneck with
@@ -450,7 +481,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12RootSignature* root_signature_bindless_vs_ = nullptr;
   ID3D12RootSignature* root_signature_bindless_ds_ = nullptr;
 
-  std::unique_ptr<SharedMemory> shared_memory_;
+  std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<PipelineCache> pipeline_cache_;
 

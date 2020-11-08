@@ -29,16 +29,23 @@ XeHSConstantDataOutput XePatchConstant(
   // [2] - between U1V1 and U0V1.
   // [3] - between U0V1 and U0V0.
   [unroll] for (i = 0u; i < 4u; ++i) {
+    // While Viva Pinata sets the factors to 0 for frustum-culled (quad)
+    // patches, in Halo 3 only allowing patches with factors above 0 makes
+    // distant (triangle) patches disappear - it appears that there are no
+    // special values for culled patches on the Xbox 360 (unlike 0 and NaN on
+    // Direct3D 11).
     output.edges[i] = clamp(
         asfloat(xe_input_patch[(i + 3u) & 3u].index_or_edge_factor) + 1.0f,
         xe_tessellation_factor_range.x, xe_tessellation_factor_range.y);
   }
 
+  // On the Xbox 360, according to the presentation, the inside factor is the
+  // minimum of the factors of the edges along the axis.
   // Direct3D 12:
   // [0] - along U.
   // [1] - along V.
-  output.inside[0u] = min(output.edges[0u], output.edges[2u]);
-  output.inside[1u] = min(output.edges[1u], output.edges[3u]);
+  output.inside[0u] = min(output.edges[1u], output.edges[3u]);
+  output.inside[1u] = min(output.edges[0u], output.edges[2u]);
 
   return output;
 }

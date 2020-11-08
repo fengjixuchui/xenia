@@ -606,9 +606,9 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
 
   const auto& regs = register_file_;
 
-#if FINE_GRAINED_DRAW_SCOPES
+#if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
-#endif  // FINE_GRAINED_DRAW_SCOPES
+#endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   uint32_t surface_pitch = std::min(rb_surface_info.surface_pitch, 2560u);
@@ -1085,7 +1085,7 @@ bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
 }
 
 bool RenderTargetCache::Resolve(const Memory& memory,
-                                SharedMemory& shared_memory,
+                                D3D12SharedMemory& shared_memory,
                                 TextureCache& texture_cache,
                                 uint32_t& written_address_out,
                                 uint32_t& written_length_out) {

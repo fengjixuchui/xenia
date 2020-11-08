@@ -832,7 +832,7 @@ const TextureCache::LoadModeInfo TextureCache::load_mode_info_[] = {
 TextureCache::TextureCache(D3D12CommandProcessor& command_processor,
                            const RegisterFile& register_file,
                            bool bindless_resources_used,
-                           SharedMemory& shared_memory)
+                           D3D12SharedMemory& shared_memory)
     : command_processor_(command_processor),
       register_file_(register_file),
       bindless_resources_used_(bindless_resources_used),
@@ -1179,9 +1179,9 @@ void TextureCache::EndFrame() {
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file_;
 
-#if FINE_GRAINED_DRAW_SCOPES
+#if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
-#endif  // FINE_GRAINED_DRAW_SCOPES
+#endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
 
   if (texture_invalidated_.exchange(false, std::memory_order_acquire)) {
     // Clear the bindings not only for this draw call, but entirely, because
@@ -1418,12 +1418,12 @@ void TextureCache::WriteActiveTextureBindfulSRV(
   }
   auto device = provider.GetDevice();
   {
-#if FINE_GRAINED_DRAW_SCOPES
+#if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
     SCOPE_profile_cpu_i(
         "gpu",
         "xe::gpu::d3d12::TextureCache::WriteActiveTextureBindfulSRV->"
         "CopyDescriptorsSimple");
-#endif  // FINE_GRAINED_DRAW_SCOPES
+#endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
     device->CopyDescriptorsSimple(1, handle, source_handle,
                                   D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   }
@@ -1604,7 +1604,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
 
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
-  shared_memory_.RangeWrittenByGPU(start_unscaled, length_unscaled);
+  shared_memory_.RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
 bool TextureCache::EnsureScaledResolveBufferResident(uint32_t start_unscaled,
@@ -1658,14 +1658,11 @@ bool TextureCache::EnsureScaledResolveBufferResident(uint32_t start_unscaled,
     UINT heap_range_start_offset = 0;
     UINT range_tile_count =
         kScaledResolveHeapSize / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
-    // FIXME(Triang3l): This may cause issues if the emulator is shut down
-    // mid-frame and the heaps are destroyed before tile mappings are updated
-    // (awaiting the fence won't catch this then). Defer this until the actual
-    // command list submission.
     direct_queue->UpdateTileMappings(
         scaled_resolve_buffer_, 1, &region_start_coordinates, &region_size,
         scaled_resolve_heaps_[i], 1, &range_flags, &heap_range_start_offset,
         &range_tile_count, D3D12_TILE_MAPPING_FLAG_NONE);
+    command_processor_.NotifyQueueOperationsDoneDirectly();
   }
   return true;
 }
