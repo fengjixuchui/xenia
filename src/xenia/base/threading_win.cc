@@ -57,7 +57,7 @@ void raise_thread_name_exception(HANDLE thread, const std::string& name) {
   }
 }
 
-void set_name(HANDLE thread, const std::string_view name) {
+static void set_name(HANDLE thread, const std::string_view name) {
   auto kernel = GetModuleHandleW(L"kernel32.dll");
   if (kernel) {
     auto func =
@@ -388,16 +388,16 @@ class Win32Thread : public Win32Handle<Thread> {
     QueueUserAPC(DispatchApc, handle_, reinterpret_cast<ULONG_PTR>(apc_data));
   }
 
-  bool Resume(uint32_t* out_new_suspend_count = nullptr) override {
-    if (out_new_suspend_count) {
-      *out_new_suspend_count = 0;
+  bool Resume(uint32_t* out_previous_suspend_count = nullptr) override {
+    if (out_previous_suspend_count) {
+      *out_previous_suspend_count = 0;
     }
     DWORD result = ResumeThread(handle_);
     if (result == UINT_MAX) {
       return false;
     }
-    if (out_new_suspend_count) {
-      *out_new_suspend_count = result;
+    if (out_previous_suspend_count) {
+      *out_previous_suspend_count = result;
     }
     return true;
   }

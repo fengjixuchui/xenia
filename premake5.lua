@@ -1,5 +1,9 @@
 include("tools/build")
 require("third_party/premake-export-compile-commands/export-compile-commands")
+require("third_party/premake-cmake/cmake")
+-- gmake required for androidmk.
+require("gmake")
+require("third_party/premake-androidmk/androidmk")
 
 location(build_root)
 targetdir(build_bin)
@@ -24,6 +28,11 @@ defines({
   "UNICODE",
 })
 
+cppdialect("C++17")
+exceptionhandling("On")
+rtti("On")
+symbols("On")
+
 -- TODO(DrChat): Find a way to disable this on other architectures.
 if ARCH ~= "ppc64" then
   filter("architecture:x86_64")
@@ -44,30 +53,29 @@ filter("kind:StaticLib")
 
 filter("configurations:Checked")
   runtime("Debug")
+  optimize("Off")
   defines({
     "DEBUG",
   })
-  runtime("Debug")
 filter({"configurations:Checked", "platforms:Windows"})
   buildoptions({
-    "/RTCsu",   -- Full Run-Time Checks.
+    "/RTCsu",           -- Full Run-Time Checks.
+  })
+filter({"configurations:Checked", "platforms:Linux"})
+  defines({
+    "_GLIBCXX_DEBUG",   -- libstdc++ debug mode
   })
 
 filter("configurations:Debug")
-  runtime("Debug")
+  runtime("Release")
+  optimize("Off")
   defines({
     "DEBUG",
     "_NO_DEBUG_HEAP=1",
   })
-  runtime("Release")
-filter({"configurations:Debug", "platforms:Windows"})
-  linkoptions({
-    "/NODEFAULTLIB:MSVCRTD",
-  })
-
 filter({"configurations:Debug", "platforms:Linux"})
-  buildoptions({
-    "-g",
+  defines({
+    "_GLIBCXX_DEBUG",   -- make dbg symbols work on some distros
   })
 
 filter("configurations:Release")
@@ -76,26 +84,23 @@ filter("configurations:Release")
     "NDEBUG",
     "_NO_DEBUG_HEAP=1",
   })
-  optimize("speed")
+  optimize("Speed")
   inlining("Auto")
-  floatingpoint("Fast")
   flags({
     "LinkTimeOptimization",
   })
-  runtime("Release")
-filter({"configurations:Release", "platforms:Windows"})
-  linkoptions({
-    "/NODEFAULTLIB:MSVCRTD",
-  })
-
+  -- Not using floatingpoint("Fast") - NaN checks are used in some places
+  -- (though rarely), overall preferable to avoid any functional differences
+  -- between debug and release builds, and to have calculations involved in GPU
+  -- (especially anything that may affect vertex position invariance) and CPU
+  -- (such as constant propagation) emulation as predictable as possible,
+  -- including handling of specials since games make assumptions about them.
 filter("platforms:Linux")
   system("linux")
   toolset("clang")
-  cppdialect("C++17")
   buildoptions({
     -- "-mlzcnt",  -- (don't) Assume lzcnt is supported.
-    "`pkg-config --cflags gtk+-x11-3.0`",
-    "-fno-lto", -- Premake doesn't support LTO on clang
+    ({os.outputof("pkg-config --cflags gtk+-x11-3.0")})[1],
   })
   links({
     "stdc++fs",
@@ -105,14 +110,13 @@ filter("platforms:Linux")
     "rt",
   })
   linkoptions({
-    "`pkg-config --libs gtk+-3.0`",
+    ({os.outputof("pkg-config --libs gtk+-3.0")})[1],
   })
 
 filter({"platforms:Linux", "kind:*App"})
   linkgroups("On")
 
 filter({"platforms:Linux", "language:C++", "toolset:gcc"})
-  cppdialect("C++17")
   links({
   })
   disablewarnings({
@@ -144,16 +148,21 @@ filter({"platforms:Linux", "language:C++", "toolset:clang", "files:*.cc or *.cpp
     "-stdlib=libstdc++",
   })
 
+filter("platforms:Android")
+  system("android")
+  links({
+    "android",
+    "dl",
+  })
+
 filter("platforms:Windows")
   system("windows")
   toolset("msc")
-  cppdialect("C++17")
   buildoptions({
-    "/MP",      -- Multiprocessor compilation.
     "/utf-8",   -- 'build correctly on systems with non-Latin codepages'.
     -- Mark warnings as severe
-    "/w14839", -- non-standard use of class 'type' as an argument to a variadic function
-    "/w14840", -- non-portable use of class 'type' as an argument to a variadic function
+    "/w14839",  -- non-standard use of class 'type' as an argument to a variadic function
+    "/w14840",  -- non-portable use of class 'type' as an argument to a variadic function
     -- Disable warnings
     "/wd4100",  -- Unreferenced parameters are ok.
     "/wd4201",  -- Nameless struct/unions are ok.
@@ -163,10 +172,10 @@ filter("platforms:Windows")
     "/wd4189",  -- 'local variable is initialized but not referenced'.
   })
   flags({
-    "NoMinimalRebuild", -- Required for /MP above.
+    "MultiProcessorCompile",  -- Multiprocessor compilation.
+    "NoMinimalRebuild",       -- Required for /MP above.
   })
 
-  symbols("On")
   defines({
     "_CRT_NONSTDC_NO_DEPRECATE",
     "_CRT_SECURE_NO_WARNINGS",
@@ -197,18 +206,24 @@ end
 solution("xenia")
   uuid("931ef4b0-6170-4f7a-aaf2-0fece7632747")
   startproject("xenia-app")
-  architecture("x86_64")
-  if os.istarget("linux") then
-    platforms({"Linux"})
-  elseif os.istarget("windows") then
-    platforms({"Windows"})
-    -- 10.0.15063.0: ID3D12GraphicsCommandList1::SetSamplePositions.
-    -- 10.0.19041.0: D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.
-    filter("action:vs2017")
-      systemversion("10.0.19041.0")
-    filter("action:vs2019")
-      systemversion("10.0")
-    filter({})
+  if os.istarget("android") then
+    -- Not setting architecture as that's handled by ndk-build itself.
+    platforms({"Android"})
+    ndkstl("c++_static")
+  else
+    architecture("x86_64")
+    if os.istarget("linux") then
+      platforms({"Linux"})
+    elseif os.istarget("windows") then
+      platforms({"Windows"})
+      -- 10.0.15063.0: ID3D12GraphicsCommandList1::SetSamplePositions.
+      -- 10.0.19041.0: D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.
+      filter("action:vs2017")
+        systemversion("10.0.19041.0")
+      filter("action:vs2019")
+        systemversion("10.0")
+      filter({})
+    end
   end
   configurations({"Checked", "Debug", "Release"})
 
@@ -223,18 +238,15 @@ solution("xenia")
   include("third_party/imgui.lua")
   include("third_party/libav.lua")
   include("third_party/mspack.lua")
-  include("third_party/SDL2.lua")
   include("third_party/snappy.lua")
   include("third_party/spirv-tools.lua")
   include("third_party/volk.lua")
   include("third_party/xxhash.lua")
 
   include("src/xenia")
-  include("src/xenia/app")
   include("src/xenia/app/discord")
   include("src/xenia/apu")
   include("src/xenia/apu/nop")
-  include("src/xenia/apu/sdl")
   include("src/xenia/base")
   include("src/xenia/cpu")
   include("src/xenia/cpu/backend/x64")
@@ -242,15 +254,31 @@ solution("xenia")
   include("src/xenia/gpu")
   include("src/xenia/gpu/null")
   include("src/xenia/gpu/vulkan")
-  include("src/xenia/helper/sdl")
   include("src/xenia/hid")
   include("src/xenia/hid/nop")
-  include("src/xenia/hid/sdl")
   include("src/xenia/kernel")
   include("src/xenia/ui")
   include("src/xenia/ui/spirv")
   include("src/xenia/ui/vulkan")
   include("src/xenia/vfs")
+
+  if not os.istarget("android") then
+    -- SDL2 requires sdl2-config, and as of November 2020 isn't high-quality on
+    -- Android yet, most importantly in game controllers - the keycode and axis
+    -- enums are being ruined during conversion to SDL2 enums resulting in only
+    -- one controller (Nvidia Shield) being supported, digital triggers are also
+    -- not supported; lifecycle management (especially surface loss) is also
+    -- complicated.
+    include("third_party/SDL2.lua")
+
+    include("src/xenia/apu/sdl")
+    include("src/xenia/helper/sdl")
+    include("src/xenia/hid/sdl")
+
+    -- TODO(Triang3l): src/xenia/app has a dependency on xenia-helper-sdl, bring
+    -- it back later.
+    include("src/xenia/app")
+  end
 
   if os.istarget("windows") then
     include("src/xenia/apu/xaudio2")

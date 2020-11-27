@@ -21,6 +21,7 @@
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
+#include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
@@ -387,7 +388,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(
         sampler_count_vertex);
     return nullptr;
   }
-  root_signatures_bindful_.insert({index, root_signature});
+  root_signatures_bindful_.emplace(index, root_signature);
   return root_signature;
 }
 
@@ -745,12 +746,11 @@ void D3D12CommandProcessor::SetSamplePositions(
   current_sample_positions_ = sample_positions;
 }
 
-void D3D12CommandProcessor::SetComputePipelineState(
-    ID3D12PipelineState* pipeline_state) {
-  if (current_external_pipeline_state_ != pipeline_state) {
-    deferred_command_list_.D3DSetPipelineState(pipeline_state);
-    current_external_pipeline_state_ = pipeline_state;
-    current_cached_pipeline_state_ = nullptr;
+void D3D12CommandProcessor::SetComputePipeline(ID3D12PipelineState* pipeline) {
+  if (current_external_pipeline_ != pipeline) {
+    deferred_command_list_.D3DSetPipelineState(pipeline);
+    current_external_pipeline_ = pipeline;
+    current_cached_pipeline_ = nullptr;
   }
 }
 
@@ -773,8 +773,16 @@ std::string D3D12CommandProcessor::GetWindowTitleText() const {
     }
     // Currently scaling is only supported with ROV.
     if (texture_cache_ != nullptr && texture_cache_->IsResolutionScale2X()) {
-      return "Direct3D 12 - 2x";
+      return "Direct3D 12 - ROV 2x";
     }
+    // Rasterizer-ordered views are a feature very rarely used as of 2020 and
+    // that faces adoption complications (outside of Direct3D - on Vulkan - at
+    // least), but crucial to Xenia - raise awareness of its usage.
+    // https://github.com/KhronosGroup/Vulkan-Ecosystem/issues/27#issuecomment-455712319
+    // "In Xenia's title bar "D3D12 ROV" can be seen, which was a surprise, as I
+    //  wasn't aware that Xenia D3D12 backend was using Raster Order Views
+    //  feature" - oscarbg in that issue.
+    return "Direct3D 12 - ROV";
   }
   return "Direct3D 12";
 }
@@ -1196,7 +1204,7 @@ bool D3D12CommandProcessor::SetupContext() {
       *this, *register_file_, bindless_resources_used_, edram_rov_used_,
       texture_cache_->IsResolutionScale2X() ? 2 : 1);
   if (!pipeline_cache_->Initialize()) {
-    XELOGE("Failed to initialize the graphics pipeline state cache");
+    XELOGE("Failed to initialize the graphics pipeline cache");
     return false;
   }
 
@@ -1526,8 +1534,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   // Shut down binding - bindless descriptors may be owned by subsystems like
   // the texture cache.
 
-  // Root signatured are used by pipeline states, thus freed after the pipeline
-  // states.
+  // Root signatures are used by pipelines, thus freed after the pipelines.
   ui::d3d12::util::ReleaseAndNull(root_signature_bindless_ds_);
   ui::d3d12::util::ReleaseAndNull(root_signature_bindless_vs_);
   for (auto it : root_signatures_bindful_) {
@@ -1869,16 +1876,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       !pixel_shader->memexport_stream_constants().empty();
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
-  bool primitive_two_faced =
-      xenos::IsPrimitiveTwoFaced(tessellated, primitive_type);
+  bool primitive_polygonal =
+      xenos::IsPrimitivePolygonal(tessellated, primitive_type);
   auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   if (!memexport_used_vertex &&
       (sq_program_cntl.vs_export_mode ==
            xenos::VertexShaderExportMode::kMultipass ||
-       (primitive_two_faced && pa_su_sc_mode_cntl.cull_front &&
+       (primitive_polygonal && pa_su_sc_mode_cntl.cull_front &&
         pa_su_sc_mode_cntl.cull_back))) {
-    // All faces are culled - can't be expressed in the pipeline state.
+    // All faces are culled - can't be expressed in the pipeline.
     return true;
   }
 
@@ -1954,7 +1961,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     line_loop_closing_index = 0;
   }
 
-  // Update the textures - this may bind pipeline state objects.
+  // Update the textures - this may bind pipelines.
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMask() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMask() : 0);
@@ -1972,32 +1979,62 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     early_z = true;
   }
 
-  // Create the pipeline state object if needed and bind it.
-  void* pipeline_state_handle;
+  // Create the pipeline if needed and bind it.
+  void* pipeline_handle;
   ID3D12RootSignature* root_signature;
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader, pixel_shader, primitive_type_converted,
           indexed ? index_buffer_info->format : xenos::IndexFormat::kInt16,
-          early_z, pipeline_render_targets, &pipeline_state_handle,
+          early_z, pipeline_render_targets, &pipeline_handle,
           &root_signature)) {
     return false;
   }
-  if (current_cached_pipeline_state_ != pipeline_state_handle) {
+  if (current_cached_pipeline_ != pipeline_handle) {
     deferred_command_list_.SetPipelineStateHandle(
-        reinterpret_cast<void*>(pipeline_state_handle));
-    current_cached_pipeline_state_ = pipeline_state_handle;
-    current_external_pipeline_state_ = nullptr;
+        reinterpret_cast<void*>(pipeline_handle));
+    current_cached_pipeline_ = pipeline_handle;
+    current_external_pipeline_ = nullptr;
   }
 
+  // Get dynamic rasterizer state.
+  // Supersampling replacing multisampling due to difficulties of emulating
+  // EDRAM with multisampling with RTV/DSV (with ROV, there's MSAA), and also
+  // resolution scale.
+  uint32_t pixel_size_x, pixel_size_y;
+  if (edram_rov_used_) {
+    pixel_size_x = 1;
+    pixel_size_y = 1;
+  } else {
+    xenos::MsaaSamples msaa_samples =
+        regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
+    pixel_size_x = msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
+    pixel_size_y = msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
+  }
+  if (texture_cache_->IsResolutionScale2X()) {
+    pixel_size_x *= 2;
+    pixel_size_y *= 2;
+  }
+  draw_util::ViewportInfo viewport_info;
+  draw_util::GetHostViewportInfo(regs, float(pixel_size_x), float(pixel_size_y),
+                                 true, float(D3D12_VIEWPORT_BOUNDS_MAX),
+                                 float(D3D12_VIEWPORT_BOUNDS_MAX), false,
+                                 viewport_info);
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  scissor.left *= pixel_size_x;
+  scissor.top *= pixel_size_y;
+  scissor.width *= pixel_size_x;
+  scissor.height *= pixel_size_y;
+
   // Update viewport, scissor, blend factor and stencil reference.
-  UpdateFixedFunctionState(primitive_two_faced);
+  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal);
 
   // Update system constants before uploading them.
   UpdateSystemConstantValues(
-      memexport_used, primitive_two_faced, line_loop_closing_index,
+      memexport_used, primitive_polygonal, line_loop_closing_index,
       indexed ? index_buffer_info->endianness : xenos::Endian::kNone,
-      used_texture_mask, early_z, GetCurrentColorMask(pixel_shader),
-      pipeline_render_targets);
+      viewport_info, pixel_size_x, pixel_size_y, used_texture_mask, early_z,
+      GetCurrentColorMask(pixel_shader), pipeline_render_targets);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature)) {
@@ -2005,14 +2042,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
   // Must not call anything that can change the descriptor heap from now on!
 
-  // Ensure vertex and index buffers are resident and draw.
+  // Ensure vertex buffers are resident.
   // TODO(Triang3l): Cache residency for ranges in a way similar to how texture
-  // validity will be tracked.
+  // validity is tracked.
   uint64_t vertex_buffers_resident[2] = {};
-  for (const auto& vertex_binding : vertex_shader->vertex_bindings()) {
+  for (const Shader::VertexBinding& vertex_binding :
+       vertex_shader->vertex_bindings()) {
     uint32_t vfetch_index = vertex_binding.fetch_constant;
     if (vertex_buffers_resident[vfetch_index >> 6] &
-        (1ull << (vfetch_index & 63))) {
+        (uint64_t(1) << (vfetch_index & 63))) {
       continue;
     }
     const auto& vfetch_constant = regs.Get<xenos::xe_gpu_vertex_fetch_t>(
@@ -2045,7 +2083,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           vfetch_constant.address << 2, vfetch_constant.size << 2);
       return false;
     }
-    vertex_buffers_resident[vfetch_index >> 6] |= 1ull << (vfetch_index & 63);
+    vertex_buffers_resident[vfetch_index >> 6] |= uint64_t(1)
+                                                  << (vfetch_index & 63);
   }
 
   // Gather memexport ranges and ensure the heaps for them are resident, and
@@ -2517,8 +2556,8 @@ void D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     submission_open_ = true;
 
     // Start a new deferred command list - will submit it to the real one in the
-    // end of the submission (when async pipeline state object creation requests
-    // are fulfilled).
+    // end of the submission (when async pipeline creation requests are
+    // fulfilled).
     deferred_command_list_.Reset();
 
     // Reset cached state of the command list.
@@ -2527,8 +2566,8 @@ void D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     ff_blend_factor_update_needed_ = true;
     ff_stencil_ref_update_needed_ = true;
     current_sample_positions_ = xenos::MsaaSamples::k1X;
-    current_cached_pipeline_state_ = nullptr;
-    current_external_pipeline_state_ = nullptr;
+    current_cached_pipeline_ = nullptr;
+    current_external_pipeline_ = nullptr;
     current_graphics_root_signature_ = nullptr;
     current_graphics_root_up_to_date_ = 0;
     if (bindless_resources_used_) {
@@ -2724,7 +2763,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {
-  return !submission_open_ || !pipeline_cache_->IsCreatingPipelineStates();
+  return !submission_open_ || !pipeline_cache_->IsCreatingPipelines();
 }
 
 void D3D12CommandProcessor::ClearCommandAllocatorCache() {
@@ -2744,87 +2783,21 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
   command_allocator_writable_last_ = nullptr;
 }
 
-void D3D12CommandProcessor::UpdateFixedFunctionState(bool primitive_two_faced) {
-  auto& regs = *register_file_;
-
+void D3D12CommandProcessor::UpdateFixedFunctionState(
+    const draw_util::ViewportInfo& viewport_info,
+    const draw_util::Scissor& scissor, bool primitive_polygonal) {
 #if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
 
-  // Window parameters.
-  // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
-  // See r200UpdateWindow:
-  // https://github.com/freedreno/mesa/blob/master/src/mesa/drivers/dri/r200/r200_state.c
-  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-
-  // Supersampling replacing multisampling due to difficulties of emulating
-  // EDRAM with multisampling with RTV/DSV (with ROV, there's MSAA), and also
-  // resolution scale.
-  uint32_t pixel_size_x, pixel_size_y;
-  if (edram_rov_used_) {
-    pixel_size_x = 1;
-    pixel_size_y = 1;
-  } else {
-    xenos::MsaaSamples msaa_samples =
-        regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
-    pixel_size_x = msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
-    pixel_size_y = msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
-  }
-  if (texture_cache_->IsResolutionScale2X()) {
-    pixel_size_x *= 2;
-    pixel_size_y *= 2;
-  }
-
   // Viewport.
-  // PA_CL_VTE_CNTL contains whether offsets and scales are enabled.
-  // http://www.x.org/docs/AMD/old/evergreen_3D_registers_v2.pdf
-  // In games, either all are enabled (for regular drawing) or none are (for
-  // rectangle lists usually).
-  //
-  // If scale/offset is enabled, the Xenos shader is writing (neglecting W
-  // division) position in the NDC (-1, -1, dx_clip_space_def - 1) -> (1, 1, 1)
-  // box. If it's not, the position is in screen space. Since we can only use
-  // the NDC in PC APIs, we use a viewport of the largest possible size, and
-  // divide the position by it in translated shaders.
-  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
-  float viewport_scale_x =
-      pa_cl_vte_cntl.vport_x_scale_ena
-          ? std::abs(regs[XE_GPU_REG_PA_CL_VPORT_XSCALE].f32)
-          : 4096.0f;
-  float viewport_scale_y =
-      pa_cl_vte_cntl.vport_y_scale_ena
-          ? std::abs(regs[XE_GPU_REG_PA_CL_VPORT_YSCALE].f32)
-          : 4096.0f;
-  float viewport_scale_z = pa_cl_vte_cntl.vport_z_scale_ena
-                               ? regs[XE_GPU_REG_PA_CL_VPORT_ZSCALE].f32
-                               : 1.0f;
-  float viewport_offset_x = pa_cl_vte_cntl.vport_x_offset_ena
-                                ? regs[XE_GPU_REG_PA_CL_VPORT_XOFFSET].f32
-                                : std::abs(viewport_scale_x);
-  float viewport_offset_y = pa_cl_vte_cntl.vport_y_offset_ena
-                                ? regs[XE_GPU_REG_PA_CL_VPORT_YOFFSET].f32
-                                : std::abs(viewport_scale_y);
-  float viewport_offset_z = pa_cl_vte_cntl.vport_z_offset_ena
-                                ? regs[XE_GPU_REG_PA_CL_VPORT_ZOFFSET].f32
-                                : 0.0f;
-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
-    viewport_offset_x += float(pa_sc_window_offset.window_x_offset);
-    viewport_offset_y += float(pa_sc_window_offset.window_y_offset);
-  }
   D3D12_VIEWPORT viewport;
-  viewport.TopLeftX =
-      (viewport_offset_x - viewport_scale_x) * float(pixel_size_x);
-  viewport.TopLeftY =
-      (viewport_offset_y - viewport_scale_y) * float(pixel_size_y);
-  viewport.Width = viewport_scale_x * 2.0f * float(pixel_size_x);
-  viewport.Height = viewport_scale_y * 2.0f * float(pixel_size_y);
-  viewport.MinDepth = viewport_offset_z;
-  viewport.MaxDepth = viewport_offset_z + viewport_scale_z;
-  if (viewport_scale_z < 0.0f) {
-    // MinDepth > MaxDepth doesn't work on Nvidia, emulating it in vertex
-    // shaders and when applying polygon offset.
-    std::swap(viewport.MinDepth, viewport.MaxDepth);
-  }
+  viewport.TopLeftX = viewport_info.left;
+  viewport.TopLeftY = viewport_info.top;
+  viewport.Width = viewport_info.width;
+  viewport.Height = viewport_info.height;
+  viewport.MinDepth = viewport_info.z_min;
+  viewport.MaxDepth = viewport_info.z_max;
   ff_viewport_update_needed_ |= ff_viewport_.TopLeftX != viewport.TopLeftX;
   ff_viewport_update_needed_ |= ff_viewport_.TopLeftY != viewport.TopLeftY;
   ff_viewport_update_needed_ |= ff_viewport_.Width != viewport.Width;
@@ -2838,38 +2811,24 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(bool primitive_two_faced) {
   }
 
   // Scissor.
-  auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
-  auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-  D3D12_RECT scissor;
-  scissor.left = pa_sc_window_scissor_tl.tl_x;
-  scissor.top = pa_sc_window_scissor_tl.tl_y;
-  scissor.right = pa_sc_window_scissor_br.br_x;
-  scissor.bottom = pa_sc_window_scissor_br.br_y;
-  if (!pa_sc_window_scissor_tl.window_offset_disable) {
-    scissor.left =
-        std::max(scissor.left + pa_sc_window_offset.window_x_offset, LONG(0));
-    scissor.top =
-        std::max(scissor.top + pa_sc_window_offset.window_y_offset, LONG(0));
-    scissor.right =
-        std::max(scissor.right + pa_sc_window_offset.window_x_offset, LONG(0));
-    scissor.bottom =
-        std::max(scissor.bottom + pa_sc_window_offset.window_y_offset, LONG(0));
-  }
-  scissor.left *= pixel_size_x;
-  scissor.top *= pixel_size_y;
-  scissor.right *= pixel_size_x;
-  scissor.bottom *= pixel_size_y;
-  ff_scissor_update_needed_ |= ff_scissor_.left != scissor.left;
-  ff_scissor_update_needed_ |= ff_scissor_.top != scissor.top;
-  ff_scissor_update_needed_ |= ff_scissor_.right != scissor.right;
-  ff_scissor_update_needed_ |= ff_scissor_.bottom != scissor.bottom;
+  D3D12_RECT scissor_rect;
+  scissor_rect.left = LONG(scissor.left);
+  scissor_rect.top = LONG(scissor.top);
+  scissor_rect.right = LONG(scissor.left + scissor.width);
+  scissor_rect.bottom = LONG(scissor.top + scissor.height);
+  ff_scissor_update_needed_ |= ff_scissor_.left != scissor_rect.left;
+  ff_scissor_update_needed_ |= ff_scissor_.top != scissor_rect.top;
+  ff_scissor_update_needed_ |= ff_scissor_.right != scissor_rect.right;
+  ff_scissor_update_needed_ |= ff_scissor_.bottom != scissor_rect.bottom;
   if (ff_scissor_update_needed_) {
-    ff_scissor_ = scissor;
-    deferred_command_list_.RSSetScissorRect(scissor);
+    ff_scissor_ = scissor_rect;
+    deferred_command_list_.RSSetScissorRect(scissor_rect);
     ff_scissor_update_needed_ = false;
   }
 
   if (!edram_rov_used_) {
+    const RegisterFile& regs = *register_file_;
+
     // Blend factor.
     ff_blend_factor_update_needed_ |=
         ff_blend_factor_[0] != regs[XE_GPU_REG_RB_BLEND_RED].f32;
@@ -2892,7 +2851,7 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(bool primitive_two_faced) {
     // choose the back face one only if drawing only back faces.
     Register stencil_ref_mask_reg;
     auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-    if (primitive_two_faced &&
+    if (primitive_polygonal &&
         regs.Get<reg::RB_DEPTHCONTROL>().backface_enable &&
         pa_su_sc_mode_cntl.cull_front && !pa_su_sc_mode_cntl.cull_back) {
       stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
@@ -2911,22 +2870,22 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(bool primitive_two_faced) {
 }
 
 void D3D12CommandProcessor::UpdateSystemConstantValues(
-    bool shared_memory_is_uav, bool primitive_two_faced,
+    bool shared_memory_is_uav, bool primitive_polygonal,
     uint32_t line_loop_closing_index, xenos::Endian index_endian,
-    uint32_t used_texture_mask, bool early_z, uint32_t color_mask,
+    const draw_util::ViewportInfo& viewport_info, uint32_t pixel_size_x,
+    uint32_t pixel_size_y, uint32_t used_texture_mask, bool early_z,
+    uint32_t color_mask,
     const RenderTargetCache::PipelineRenderTarget render_targets[4]) {
-  auto& regs = *register_file_;
-
 #if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
 
+  const RegisterFile& regs = *register_file_;
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
   auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-  auto pa_su_vtx_cntl = regs.Get<reg::PA_SU_VTX_CNTL>();
   float rb_alpha_ref = regs[XE_GPU_REG_RB_ALPHA_REF].f32;
   auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
   auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
@@ -2992,11 +2951,6 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     }
   }
 
-  // Get viewport Z scale - needed for flags and ROV output.
-  float viewport_scale_z = pa_cl_vte_cntl.vport_z_scale_ena
-                               ? regs[XE_GPU_REG_PA_CL_VPORT_ZSCALE].f32
-                               : 1.0f;
-
   bool dirty = false;
 
   // Flags.
@@ -3029,13 +2983,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     flags |= (pa_cl_clip_cntl.value & 0b111111)
              << DxbcShaderTranslator::kSysFlag_UserClipPlane0_Shift;
   }
-  // Reversed depth.
-  if (viewport_scale_z < 0.0f) {
-    flags |= DxbcShaderTranslator::kSysFlag_ReverseZ;
-  }
-  // Whether SV_IsFrontFace matters.
-  if (primitive_two_faced) {
-    flags |= DxbcShaderTranslator::kSysFlag_PrimitiveTwoFaced;
+  // Whether the primitive is polygonal and SV_IsFrontFace matters.
+  if (primitive_polygonal) {
+    flags |= DxbcShaderTranslator::kSysFlag_PrimitivePolygonal;
   }
   // Primitive killing condition.
   if (pa_cl_clip_cntl.vtx_kill_or) {
@@ -3103,13 +3053,13 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.line_loop_closing_index != line_loop_closing_index;
   system_constants_.line_loop_closing_index = line_loop_closing_index;
 
-  // Vertex index offset.
-  dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
-  system_constants_.vertex_base_index = vgt_indx_offset;
-
   // Index or tessellation edge factor buffer endianness.
   dirty |= system_constants_.vertex_index_endian != index_endian;
   system_constants_.vertex_index_endian = index_endian;
+
+  // Vertex index offset.
+  dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
+  system_constants_.vertex_base_index = vgt_indx_offset;
 
   // User clip planes (UCP_ENA_#), when not CLIP_DISABLE.
   if (!pa_cl_clip_cntl.clip_disable) {
@@ -3128,81 +3078,24 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   // Conversion to Direct3D 12 normalized device coordinates.
-  // See viewport configuration in UpdateFixedFunctionState for explanations.
-  // X and Y scale/offset is to convert unnormalized coordinates generated by
-  // shaders (for rectangle list drawing, for instance) to the viewport of the
-  // largest possible render target size that is used to emulate unnormalized
-  // coordinates. Z scale/offset is to convert from OpenGL NDC to Direct3D NDC
-  // if needed. Also apply half-pixel offset to reproduce Direct3D 9
-  // rasterization rules - must be done before clipping, not through the
-  // viewport, for SSAA and resolution scale to work correctly.
-  float viewport_scale_x = regs[XE_GPU_REG_PA_CL_VPORT_XSCALE].f32;
-  float viewport_scale_y = regs[XE_GPU_REG_PA_CL_VPORT_YSCALE].f32;
   // Kill all primitives if multipass or both faces are culled, but still need
   // to do memexport.
   if (sq_program_cntl.vs_export_mode ==
           xenos::VertexShaderExportMode::kMultipass ||
-      (primitive_two_faced && pa_su_sc_mode_cntl.cull_front &&
+      (primitive_polygonal && pa_su_sc_mode_cntl.cull_front &&
        pa_su_sc_mode_cntl.cull_back)) {
-    dirty |= !std::isnan(system_constants_.ndc_scale[0]);
-    dirty |= !std::isnan(system_constants_.ndc_scale[1]);
-    dirty |= !std::isnan(system_constants_.ndc_scale[2]);
-    dirty |= !std::isnan(system_constants_.ndc_offset[0]);
-    dirty |= !std::isnan(system_constants_.ndc_offset[1]);
-    dirty |= !std::isnan(system_constants_.ndc_offset[2]);
     float nan_value = std::nanf("");
-    system_constants_.ndc_scale[0] = nan_value;
-    system_constants_.ndc_scale[1] = nan_value;
-    system_constants_.ndc_scale[2] = nan_value;
-    system_constants_.ndc_offset[0] = nan_value;
-    system_constants_.ndc_offset[1] = nan_value;
-    system_constants_.ndc_offset[2] = nan_value;
-  } else {
-    // When VPORT_Z_SCALE_ENA is disabled, Z/W is directly what is expected to
-    // be written to the depth buffer, and for some reason DX_CLIP_SPACE_DEF
-    // isn't set in this case in draws in games.
-    bool gl_clip_space_def =
-        !pa_cl_clip_cntl.dx_clip_space_def && pa_cl_vte_cntl.vport_z_scale_ena;
-    float ndc_scale_x = pa_cl_vte_cntl.vport_x_scale_ena
-                            ? (viewport_scale_x >= 0.0f ? 1.0f : -1.0f)
-                            : (1.0f / 4096.0f);
-    float ndc_scale_y = pa_cl_vte_cntl.vport_y_scale_ena
-                            ? (viewport_scale_y >= 0.0f ? -1.0f : 1.0f)
-                            : (-1.0f / 4096.0f);
-    float ndc_scale_z = gl_clip_space_def ? 0.5f : 1.0f;
-    float ndc_offset_x = pa_cl_vte_cntl.vport_x_offset_ena ? 0.0f : -1.0f;
-    float ndc_offset_y = pa_cl_vte_cntl.vport_y_offset_ena ? 0.0f : 1.0f;
-    float ndc_offset_z = gl_clip_space_def ? 0.5f : 0.0f;
-    if (cvars::half_pixel_offset && !pa_su_vtx_cntl.pix_center) {
-      // Signs are hopefully correct here, tested in GTA IV on both clearing
-      // (without a viewport) and drawing things near the edges of the screen.
-      if (pa_cl_vte_cntl.vport_x_scale_ena) {
-        if (viewport_scale_x != 0.0f) {
-          ndc_offset_x += 0.5f / viewport_scale_x;
-        }
-      } else {
-        ndc_offset_x += 1.0f / xenos::kTexture2DCubeMaxWidthHeight;
-      }
-      if (pa_cl_vte_cntl.vport_y_scale_ena) {
-        if (viewport_scale_y != 0.0f) {
-          ndc_offset_y += 0.5f / viewport_scale_y;
-        }
-      } else {
-        ndc_offset_y -= 1.0f / xenos::kTexture2DCubeMaxWidthHeight;
-      }
+    for (uint32_t i = 0; i < 3; ++i) {
+      dirty |= !std::isnan(system_constants_.ndc_scale[i]);
+      system_constants_.ndc_scale[i] = nan_value;
     }
-    dirty |= system_constants_.ndc_scale[0] != ndc_scale_x;
-    dirty |= system_constants_.ndc_scale[1] != ndc_scale_y;
-    dirty |= system_constants_.ndc_scale[2] != ndc_scale_z;
-    dirty |= system_constants_.ndc_offset[0] != ndc_offset_x;
-    dirty |= system_constants_.ndc_offset[1] != ndc_offset_y;
-    dirty |= system_constants_.ndc_offset[2] != ndc_offset_z;
-    system_constants_.ndc_scale[0] = ndc_scale_x;
-    system_constants_.ndc_scale[1] = ndc_scale_y;
-    system_constants_.ndc_scale[2] = ndc_scale_z;
-    system_constants_.ndc_offset[0] = ndc_offset_x;
-    system_constants_.ndc_offset[1] = ndc_offset_y;
-    system_constants_.ndc_offset[2] = ndc_offset_z;
+  } else {
+    for (uint32_t i = 0; i < 3; ++i) {
+      dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
+      dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
+      system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
+      system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+    }
   }
 
   // Point size.
@@ -3218,19 +3111,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   system_constants_.point_size[1] = point_size_y;
   system_constants_.point_size_min_max[0] = point_size_min;
   system_constants_.point_size_min_max[1] = point_size_max;
-  float point_screen_to_ndc_x, point_screen_to_ndc_y;
-  if (pa_cl_vte_cntl.vport_x_scale_ena) {
-    point_screen_to_ndc_x =
-        (viewport_scale_x != 0.0f) ? (0.5f / viewport_scale_x) : 0.0f;
-  } else {
-    point_screen_to_ndc_x = 1.0f / xenos::kTexture2DCubeMaxWidthHeight;
-  }
-  if (pa_cl_vte_cntl.vport_y_scale_ena) {
-    point_screen_to_ndc_y =
-        (viewport_scale_y != 0.0f) ? (-0.5f / viewport_scale_y) : 0.0f;
-  } else {
-    point_screen_to_ndc_y = -1.0f / xenos::kTexture2DCubeMaxWidthHeight;
-  }
+  float point_screen_to_ndc_x =
+      (0.5f * 2.0f * pixel_size_x) / viewport_info.width;
+  float point_screen_to_ndc_y =
+      (0.5f * 2.0f * pixel_size_y) / viewport_info.height;
   dirty |= system_constants_.point_screen_to_ndc[0] != point_screen_to_ndc_x;
   dirty |= system_constants_.point_screen_to_ndc[1] != point_screen_to_ndc_y;
   system_constants_.point_screen_to_ndc[0] = point_screen_to_ndc_x;
@@ -3380,27 +3264,18 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     dirty |= system_constants_.edram_depth_base_dwords != depth_base_dwords;
     system_constants_.edram_depth_base_dwords = depth_base_dwords;
 
-    // The Z range is reversed in the vertex shader if it's reverse - use the
-    // absolute value of the scale.
-    float depth_range_scale = std::abs(viewport_scale_z);
+    float depth_range_scale = viewport_info.z_max - viewport_info.z_min;
     dirty |= system_constants_.edram_depth_range_scale != depth_range_scale;
     system_constants_.edram_depth_range_scale = depth_range_scale;
-    float depth_range_offset = pa_cl_vte_cntl.vport_z_offset_ena
-                                   ? regs[XE_GPU_REG_PA_CL_VPORT_ZOFFSET].f32
-                                   : 0.0f;
-    if (viewport_scale_z < 0.0f) {
-      // Similar to MinDepth in fixed-function viewport calculation.
-      depth_range_offset += viewport_scale_z;
-    }
-    dirty |= system_constants_.edram_depth_range_offset != depth_range_offset;
-    system_constants_.edram_depth_range_offset = depth_range_offset;
+    dirty |= system_constants_.edram_depth_range_offset != viewport_info.z_min;
+    system_constants_.edram_depth_range_offset = viewport_info.z_min;
 
     // For non-polygons, front polygon offset is used, and it's enabled if
     // POLY_OFFSET_PARA_ENABLED is set, for polygons, separate front and back
     // are used.
     float poly_offset_front_scale = 0.0f, poly_offset_front_offset = 0.0f;
     float poly_offset_back_scale = 0.0f, poly_offset_back_offset = 0.0f;
-    if (primitive_two_faced) {
+    if (primitive_polygonal) {
       if (pa_su_sc_mode_cntl.poly_offset_front_enable) {
         poly_offset_front_scale =
             regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
@@ -3463,7 +3338,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
           system_constants_.edram_stencil_front_func_ops != stencil_func_ops;
       system_constants_.edram_stencil_front_func_ops = stencil_func_ops;
 
-      if (primitive_two_faced && rb_depthcontrol.backface_enable) {
+      if (primitive_polygonal && rb_depthcontrol.backface_enable) {
         dirty |= system_constants_.edram_stencil_back_reference !=
                  rb_stencilrefmask_bf.stencilref;
         system_constants_.edram_stencil_back_reference =
@@ -3574,7 +3449,7 @@ bool D3D12CommandProcessor::UpdateBindings(
           float_constant_map_vertex.float_bitmap[i];
       // If no float constants at all, we can reuse any buffer for them, so not
       // invalidating.
-      if (float_constant_map_vertex.float_count != 0) {
+      if (float_constant_count_vertex) {
         cbuffer_binding_float_vertex_.up_to_date = false;
       }
     }
@@ -3589,7 +3464,7 @@ bool D3D12CommandProcessor::UpdateBindings(
           float_constant_map_pixel.float_bitmap[i]) {
         current_float_constant_map_pixel_[i] =
             float_constant_map_pixel.float_bitmap[i];
-        if (float_constant_map_pixel.float_count != 0) {
+        if (float_constant_count_pixel) {
           cbuffer_binding_float_pixel_.up_to_date = false;
         }
       }
@@ -3889,8 +3764,8 @@ bool D3D12CommandProcessor::UpdateBindings(
                   sampler_parameters,
                   provider.OffsetSamplerDescriptor(
                       sampler_bindless_heap_cpu_start_, sampler_index));
-              texture_cache_bindless_sampler_map_.insert(
-                  {sampler_parameters.value, sampler_index});
+              texture_cache_bindless_sampler_map_.emplace(
+                  sampler_parameters.value, sampler_index);
             }
             current_sampler_bindless_indices_vertex_[j] = sampler_index;
           }
@@ -3921,8 +3796,8 @@ bool D3D12CommandProcessor::UpdateBindings(
                   sampler_parameters,
                   provider.OffsetSamplerDescriptor(
                       sampler_bindless_heap_cpu_start_, sampler_index));
-              texture_cache_bindless_sampler_map_.insert(
-                  {sampler_parameters.value, sampler_index});
+              texture_cache_bindless_sampler_map_.emplace(
+                  sampler_parameters.value, sampler_index);
             }
             current_sampler_bindless_indices_pixel_[j] = sampler_index;
           }

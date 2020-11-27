@@ -33,6 +33,36 @@ namespace draw_util {
 // for use with the top-left rasterization rule later.
 int32_t FloatToD3D11Fixed16p8(float f32);
 
+struct ViewportInfo {
+  // The returned viewport will always be in the positive quarter-plane for
+  // simplicity of clamping to the maximum size supported by the host, negative
+  // offset will be applied via ndc_offset.
+  float left;
+  float top;
+  float width;
+  float height;
+  float z_min;
+  float z_max;
+  float ndc_scale[3];
+  float ndc_offset[3];
+};
+// Converts the guest viewport (or fakes one if drawing without a viewport) to
+// a viewport, plus values to multiply-add the returned position by, usable on
+// host graphics APIs such as Direct3D 11+ and Vulkan, also forcing it to the
+// Direct3D clip space with 0...W Z rather than -W...W.
+void GetHostViewportInfo(const RegisterFile& regs, float pixel_size_x,
+                         float pixel_size_y, bool origin_bottom_left,
+                         float x_max, float y_max, bool allow_reverse_z,
+                         ViewportInfo& viewport_info_out);
+
+struct Scissor {
+  uint32_t left;
+  uint32_t top;
+  uint32_t width;
+  uint32_t height;
+};
+void GetScissor(const RegisterFile& regs, Scissor& scissor_out);
+
 // To avoid passing values that the shader won't understand (even though
 // Direct3D 9 shouldn't pass them anyway).
 xenos::CopySampleSelect SanitizeCopySampleSelect(

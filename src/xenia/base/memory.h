@@ -18,6 +18,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/platform.h"
 
 namespace xe {
 namespace memory {
@@ -34,6 +35,7 @@ enum class PageAccess {
   kNoAccess = 0,
   kReadOnly = 1 << 0,
   kReadWrite = kReadOnly | 1 << 1,
+  kExecuteReadOnly = kReadOnly | 1 << 2,
   kExecuteReadWrite = kReadWrite | 1 << 2,
 };
 
@@ -47,6 +49,16 @@ enum class DeallocationType {
   kRelease = 1 << 0,
   kDecommit = 1 << 1,
 };
+
+// Whether the host allows the pages to be allocated or mapped with
+// PageAccess::kExecuteReadWrite - if not, separate mappings backed by the same
+// memory-mapped file must be used to write to executable pages.
+bool IsWritableExecutableMemorySupported();
+
+// Whether PageAccess::kExecuteReadWrite is a supported and preferred way of
+// writing executable memory, useful for simulating how Xenia would work without
+// writable executable memory on a system with it.
+bool IsWritableExecutableMemoryPreferred();
 
 // Allocates a block of memory at the given page-aligned base address.
 // Fails if the memory is not available.
@@ -96,12 +108,21 @@ void AlignedFree(T* ptr) {
 #endif  // XE_COMPILER_MSVC
 }
 
+#if XE_PLATFORM_WIN32
+// HANDLE.
 typedef void* FileMappingHandle;
+constexpr FileMappingHandle kFileMappingHandleInvalid = nullptr;
+#else
+// File descriptor.
+typedef int FileMappingHandle;
+constexpr FileMappingHandle kFileMappingHandleInvalid = -1;
+#endif
 
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path,
                                           size_t length, PageAccess access,
                                           bool commit);
-void CloseFileMappingHandle(FileMappingHandle handle);
+void CloseFileMappingHandle(FileMappingHandle handle,
+                            const std::filesystem::path& path);
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
                   PageAccess access, size_t file_offset);
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length);

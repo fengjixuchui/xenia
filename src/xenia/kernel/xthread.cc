@@ -48,13 +48,13 @@ using xe::cpu::ppc::PPCOpcode;
 uint32_t next_xthread_id_ = 0;
 
 XThread::XThread(KernelState* kernel_state)
-    : XObject(kernel_state, kType), guest_thread_(true) {}
+    : XObject(kernel_state, kObjectType), guest_thread_(true) {}
 
 XThread::XThread(KernelState* kernel_state, uint32_t stack_size,
                  uint32_t xapi_thread_startup, uint32_t start_address,
                  uint32_t start_context, uint32_t creation_flags,
                  bool guest_thread, bool main_thread)
-    : XObject(kernel_state, kType),
+    : XObject(kernel_state, kObjectType),
       thread_id_(++next_xthread_id_),
       guest_thread_(guest_thread),
       main_thread_(main_thread),
@@ -156,11 +156,17 @@ void XThread::set_name(const std::string_view name) {
   }
 }
 
-uint8_t next_cpu = 0;
-uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
+static uint8_t next_cpu = 0;
+static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
+  // NOTE: proc_mask is logical processors, not physical processors or cores.
   if (!proc_mask) {
     next_cpu = (next_cpu + 1) % 6;
     return next_cpu;  // is this reasonable?
+    // TODO(Triang3l): Does the following apply here?
+    // https://docs.microsoft.com/en-us/windows/win32/dxtecharts/coding-for-multiple-cores
+    // "On Xbox 360, you must explicitly assign software threads to a particular
+    //  hardware thread by using XSetThreadProcessor. Otherwise, all child
+    //  threads will stay on the same hardware thread as the parent."
   }
   assert_false(proc_mask & 0xC0);
 
@@ -205,6 +211,7 @@ void XThread::InitializeGuestObject() {
   // 0xA88 = APC
   // 0x18 = timer
   xe::store_and_swap<uint32_t>(p + 0x09C, 0xFDFFD7FF);
+  // current_cpu is expected to be initialized externally via SetActiveCpu.
   xe::store_and_swap<uint32_t>(p + 0x0D0, stack_base_);
   xe::store_and_swap<uint64_t>(p + 0x130, Clock::QueryGuestSystemTime());
   xe::store_and_swap<uint32_t>(p + 0x144, guest_object() + 0x144);
@@ -346,6 +353,12 @@ X_STATUS XThread::Create() {
   // Exports use this to get the kernel.
   thread_state_->context()->kernel_state = kernel_state_;
 
+  uint8_t cpu_index = GetFakeCpuNumber(
+      static_cast<uint8_t>(creation_params_.creation_flags >> 24));
+
+  // Initialize the KTHREAD object.
+  InitializeGuestObject();
+
   X_KPCR* pcr = memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
 
   pcr->tls_ptr = tls_static_address_;
@@ -355,14 +368,7 @@ X_STATUS XThread::Create() {
   pcr->stack_base_ptr = stack_base_;
   pcr->stack_end_ptr = stack_limit_;
 
-  uint8_t proc_mask =
-      static_cast<uint8_t>(creation_params_.creation_flags >> 24);
-
-  pcr->current_cpu = GetFakeCpuNumber(proc_mask);  // Current CPU(?)
-  pcr->dpc_active = 0;                             // DPC active bool?
-
-  // Initialize the KTHREAD object.
-  InitializeGuestObject();
+  pcr->dpc_active = 0;  // DPC active bool?
 
   // Always retain when starting - the thread owns itself until exited.
   RetainHandle();
@@ -415,10 +421,6 @@ X_STATUS XThread::Create() {
     return X_STATUS_NO_MEMORY;
   }
 
-  if (!cvars::ignore_thread_affinities) {
-    thread_->set_affinity_mask(proc_mask);
-  }
-
   // Set the thread name based on host ID (for easier debugging).
   if (thread_name_.empty()) {
     set_name(fmt::format("XThread{:04X}", thread_->system_id()));
@@ -427,6 +429,10 @@ X_STATUS XThread::Create() {
   if (creation_params_.creation_flags & 0x60) {
     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
   }
+
+  // Assign the newly created thread to the logical processor, and also set up
+  // the current CPU in KPCR and KTHREAD.
+  SetActiveCpu(cpu_index);
 
   // Notify processor of our creation.
   emulator()->processor()->OnThreadCreated(handle(), thread_state_, this);
@@ -700,35 +706,35 @@ void XThread::SetPriority(int32_t increment) {
 }
 
 void XThread::SetAffinity(uint32_t affinity) {
-  // Affinity mask, as in SetThreadAffinityMask.
-  // Xbox thread IDs:
-  // 0 - core 0, thread 0 - user
-  // 1 - core 0, thread 1 - user
-  // 2 - core 1, thread 0 - sometimes xcontent
-  // 3 - core 1, thread 1 - user
-  // 4 - core 2, thread 0 - xaudio
-  // 5 - core 2, thread 1 - user
-  // TODO(benvanik): implement better thread distribution.
-  // NOTE: these are logical processors, not physical processors or cores.
-  if (xe::threading::logical_processor_count() < 6) {
-    XELOGW("Too few processors - scheduling will be wonky");
-  }
   SetActiveCpu(GetFakeCpuNumber(affinity));
-  affinity_ = affinity;
-  if (!cvars::ignore_thread_affinities) {
-    thread_->set_affinity_mask(affinity);
-  }
 }
 
-uint32_t XThread::active_cpu() const {
-  uint8_t* pcr = memory()->TranslateVirtual(pcr_address_);
-  return xe::load_and_swap<uint8_t>(pcr + 0x10C);
+uint8_t XThread::active_cpu() const {
+  const X_KPCR& pcr = *memory()->TranslateVirtual<const X_KPCR*>(pcr_address_);
+  return pcr.current_cpu;
 }
 
-void XThread::SetActiveCpu(uint32_t cpu_index) {
+void XThread::SetActiveCpu(uint8_t cpu_index) {
+  // May be called during thread creation - don't skip if current == new.
+
   assert_true(cpu_index < 6);
-  uint8_t* pcr = memory()->TranslateVirtual(pcr_address_);
-  xe::store_and_swap<uint8_t>(pcr + 0x10C, cpu_index);
+
+  X_KPCR& pcr = *memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
+  pcr.current_cpu = cpu_index;
+
+  if (is_guest_thread()) {
+    X_KTHREAD& thread_object =
+        *memory()->TranslateVirtual<X_KTHREAD*>(guest_object());
+    thread_object.current_cpu = cpu_index;
+  }
+
+  if (xe::threading::logical_processor_count() >= 6) {
+    if (!cvars::ignore_thread_affinities) {
+      thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+    }
+  } else {
+    XELOGW("Too few processor cores - scheduling will be wonky");
+  }
 }
 
 bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {

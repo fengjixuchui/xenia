@@ -26,6 +26,7 @@
 #include "xenia/gpu/d3d12/primitive_converter.h"
 #include "xenia/gpu/d3d12/render_target_cache.h"
 #include "xenia/gpu/d3d12/texture_cache.h"
+#include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
@@ -186,19 +187,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   // render targets or copying to depth render targets.
   void SetSamplePositions(xenos::MsaaSamples sample_positions);
 
-  // Returns a pipeline state object with deferred creation by its handle. May
-  // return nullptr if failed to create the pipeline state object.
-  inline ID3D12PipelineState* GetD3D12PipelineStateByHandle(
-      void* handle) const {
-    return pipeline_cache_->GetD3D12PipelineStateByHandle(handle);
+  // Returns a pipeline with deferred creation by its handle. May return nullptr
+  // if failed to create the pipeline.
+  ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
+    return pipeline_cache_->GetD3D12PipelineByHandle(handle);
   }
 
-  // Sets the current pipeline state to a compute one. This is for cache
-  // invalidation primarily. A submission must be open.
-  void SetComputePipelineState(ID3D12PipelineState* pipeline_state);
+  // Sets the current pipeline to a compute one. This is for cache invalidation
+  // primarily. A submission must be open.
+  void SetComputePipeline(ID3D12PipelineState* pipeline);
 
-  // For the pipeline state cache to call when binding layout UIDs may be
-  // reused.
+  // For the pipeline cache to call when binding layout UIDs may be reused.
   void NotifyShaderBindingsLayoutUIDsInvalidated();
 
   // Returns the text to display in the GPU backend name in the window title.
@@ -323,8 +322,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool EndSubmission(bool is_swap);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
-  // as when there are unfinished graphics pipeline state creation requests that
-  // would need to be fulfilled before actually submitting the command list.
+  // as when there are unfinished graphics pipeline creation requests that would
+  // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionFence(submission_current_);
@@ -347,11 +346,15 @@ class D3D12CommandProcessor : public CommandProcessor {
       D3D12_CPU_DESCRIPTOR_HANDLE& cpu_handle_out,
       D3D12_GPU_DESCRIPTOR_HANDLE& gpu_handle_out);
 
-  void UpdateFixedFunctionState(bool primitive_two_faced);
+  void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
+                                const draw_util::Scissor& scissor,
+                                bool primitive_polygonal);
   void UpdateSystemConstantValues(
-      bool shared_memory_is_uav, bool primitive_two_faced,
+      bool shared_memory_is_uav, bool primitive_polygonal,
       uint32_t line_loop_closing_index, xenos::Endian index_endian,
-      uint32_t used_texture_mask, bool early_z, uint32_t color_mask,
+      const draw_util::ViewportInfo& viewport_info, uint32_t pixel_size_x,
+      uint32_t pixel_size_y, uint32_t used_texture_mask, bool early_z,
+      uint32_t color_mask,
       const RenderTargetCache::PipelineRenderTarget render_targets[4]);
   bool UpdateBindings(const D3D12Shader* vertex_shader,
                       const D3D12Shader* pixel_shader,
@@ -503,7 +506,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   static constexpr uint32_t kSwapTextureWidth = 1280;
   static constexpr uint32_t kSwapTextureHeight = 720;
-  inline std::pair<uint32_t, uint32_t> GetSwapTextureSize() const {
+  std::pair<uint32_t, uint32_t> GetSwapTextureSize() const {
     if (texture_cache_->IsResolutionScale2X()) {
       return std::make_pair(kSwapTextureWidth * 2, kSwapTextureHeight * 2);
     }
@@ -548,13 +551,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Current SSAA sample positions (to be updated by the render target cache).
   xenos::MsaaSamples current_sample_positions_;
 
-  // Currently bound pipeline state, either a graphics pipeline state object
-  // from the pipeline state cache (with potentially deferred creation -
-  // current_external_pipeline_state_ is nullptr in this case) or a non-Xenos
-  // graphics or compute pipeline state object (current_cached_pipeline_state_
-  // is nullptr in this case).
-  void* current_cached_pipeline_state_;
-  ID3D12PipelineState* current_external_pipeline_state_;
+  // Currently bound pipeline, either a graphics pipeline from the pipeline
+  // cache (with potentially deferred creation - current_external_pipeline_ is
+  // nullptr in this case) or a non-Xenos graphics or compute pipeline
+  // (current_cached_pipeline_ is nullptr in this case).
+  void* current_cached_pipeline_;
+  ID3D12PipelineState* current_external_pipeline_;
 
   // Currently bound graphics root signature.
   ID3D12RootSignature* current_graphics_root_signature_;

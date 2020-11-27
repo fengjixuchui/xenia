@@ -113,11 +113,11 @@ Memory::~Memory() {
   heaps_.physical.Dispose();
 
   // Unmap all views and close mapping.
-  if (mapping_) {
+  if (mapping_ != xe::memory::kFileMappingHandleInvalid) {
     UnmapViews();
-    xe::memory::CloseFileMappingHandle(mapping_);
+    xe::memory::CloseFileMappingHandle(mapping_, file_name_);
     mapping_base_ = nullptr;
-    mapping_ = nullptr;
+    mapping_ = xe::memory::kFileMappingHandleInvalid;
   }
 
   virtual_membase_ = nullptr;
@@ -125,8 +125,7 @@ Memory::~Memory() {
 }
 
 bool Memory::Initialize() {
-  file_name_ =
-      fmt::format("Local\\xenia_memory_{}", Clock::QueryHostTickCount());
+  file_name_ = fmt::format("xenia_memory_{}", Clock::QueryHostTickCount());
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).
@@ -134,9 +133,9 @@ bool Memory::Initialize() {
       file_name_,
       // entire 4gb space + 512mb physical:
       0x11FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
-  if (!mapping_) {
+  if (mapping_ == xe::memory::kFileMappingHandleInvalid) {
     XELOGE("Unable to reserve the 4gb guest address space.");
-    assert_not_null(mapping_);
+    assert_always();
     return false;
   }
 
@@ -159,24 +158,26 @@ bool Memory::Initialize() {
   physical_membase_ = mapping_base_ + 0x100000000ull;
 
   // Prepare virtual heaps.
-  heaps_.v00000000.Initialize(this, virtual_membase_, 0x00000000, 0x40000000,
-                              4096);
-  heaps_.v40000000.Initialize(this, virtual_membase_, 0x40000000,
-                              0x40000000 - 0x01000000, 64 * 1024);
-  heaps_.v80000000.Initialize(this, virtual_membase_, 0x80000000, 0x10000000,
-                              64 * 1024);
-  heaps_.v90000000.Initialize(this, virtual_membase_, 0x90000000, 0x10000000,
-                              4096);
+  heaps_.v00000000.Initialize(this, virtual_membase_, HeapType::kGuestVirtual,
+                              0x00000000, 0x40000000, 4096);
+  heaps_.v40000000.Initialize(this, virtual_membase_, HeapType::kGuestVirtual,
+                              0x40000000, 0x40000000 - 0x01000000, 64 * 1024);
+  heaps_.v80000000.Initialize(this, virtual_membase_, HeapType::kGuestXex,
+                              0x80000000, 0x10000000, 64 * 1024);
+  heaps_.v90000000.Initialize(this, virtual_membase_, HeapType::kGuestXex,
+                              0x90000000, 0x10000000, 4096);
 
   // Prepare physical heaps.
-  heaps_.physical.Initialize(this, physical_membase_, 0x00000000, 0x20000000,
-                             4096);
-  heaps_.vA0000000.Initialize(this, virtual_membase_, 0xA0000000, 0x20000000,
-                              64 * 1024, &heaps_.physical);
-  heaps_.vC0000000.Initialize(this, virtual_membase_, 0xC0000000, 0x20000000,
-                              16 * 1024 * 1024, &heaps_.physical);
-  heaps_.vE0000000.Initialize(this, virtual_membase_, 0xE0000000, 0x1FD00000,
-                              4096, &heaps_.physical);
+  heaps_.physical.Initialize(this, physical_membase_, HeapType::kGuestPhysical,
+                             0x00000000, 0x20000000, 4096);
+  heaps_.vA0000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
+                              0xA0000000, 0x20000000, 64 * 1024,
+                              &heaps_.physical);
+  heaps_.vC0000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
+                              0xC0000000, 0x20000000, 16 * 1024 * 1024,
+                              &heaps_.physical);
+  heaps_.vE0000000.Initialize(this, virtual_membase_, HeapType::kGuestPhysical,
+                              0xE0000000, 0x1FD00000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
   heaps_.v00000000.AllocFixed(
@@ -374,7 +375,7 @@ uint32_t Memory::HostToGuestVirtualThunk(const void* context,
 
 uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
   const BaseHeap* heap = LookupHeap(address);
-  if (!heap || !heap->IsGuestPhysicalHeap()) {
+  if (!heap || heap->heap_type() != HeapType::kGuestPhysical) {
     return UINT32_MAX;
   }
   return static_cast<const PhysicalHeap*>(heap)->GetPhysicalAddress(address);
@@ -450,7 +451,7 @@ bool Memory::AccessViolationCallback(
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
-  if (!heap->IsGuestPhysicalHeap()) {
+  if (heap->heap_type() != HeapType::kGuestPhysical) {
     return false;
   }
 
@@ -476,7 +477,7 @@ bool Memory::TriggerPhysicalMemoryCallbacks(
     uint32_t virtual_address, uint32_t length, bool is_write,
     bool unwatch_exact_range, bool unprotect) {
   BaseHeap* heap = LookupHeap(virtual_address);
-  if (heap->IsGuestPhysicalHeap()) {
+  if (heap->heap_type() == HeapType::kGuestPhysical) {
     auto physical_heap = static_cast<PhysicalHeap*>(heap);
     return physical_heap->TriggerCallbacks(std::move(global_lock_locked_once),
                                            virtual_address, length, is_write,
@@ -620,6 +621,10 @@ uint32_t FromPageAccess(xe::memory::PageAccess protect) {
       return kMemoryProtectRead;
     case memory::PageAccess::kReadWrite:
       return kMemoryProtectRead | kMemoryProtectWrite;
+    case memory::PageAccess::kExecuteReadOnly:
+      // Guest memory cannot be executable - this should never happen :)
+      assert_always();
+      return kMemoryProtectRead;
     case memory::PageAccess::kExecuteReadWrite:
       // Guest memory cannot be executable - this should never happen :)
       assert_always();
@@ -634,11 +639,12 @@ BaseHeap::BaseHeap()
 
 BaseHeap::~BaseHeap() = default;
 
-void BaseHeap::Initialize(Memory* memory, uint8_t* membase, uint32_t heap_base,
-                          uint32_t heap_size, uint32_t page_size,
-                          uint32_t host_address_offset) {
+void BaseHeap::Initialize(Memory* memory, uint8_t* membase, HeapType heap_type,
+                          uint32_t heap_base, uint32_t heap_size,
+                          uint32_t page_size, uint32_t host_address_offset) {
   memory_ = memory;
   membase_ = membase;
+  heap_type_ = heap_type;
   heap_base_ = heap_base;
   heap_size_ = heap_size;
   page_size_ = page_size;
@@ -1347,9 +1353,10 @@ VirtualHeap::VirtualHeap() = default;
 VirtualHeap::~VirtualHeap() = default;
 
 void VirtualHeap::Initialize(Memory* memory, uint8_t* membase,
-                             uint32_t heap_base, uint32_t heap_size,
-                             uint32_t page_size) {
-  BaseHeap::Initialize(memory, membase, heap_base, heap_size, page_size);
+                             HeapType heap_type, uint32_t heap_base,
+                             uint32_t heap_size, uint32_t page_size) {
+  BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size,
+                       page_size);
 }
 
 PhysicalHeap::PhysicalHeap() : parent_heap_(nullptr) {}
@@ -1357,8 +1364,9 @@ PhysicalHeap::PhysicalHeap() : parent_heap_(nullptr) {}
 PhysicalHeap::~PhysicalHeap() = default;
 
 void PhysicalHeap::Initialize(Memory* memory, uint8_t* membase,
-                              uint32_t heap_base, uint32_t heap_size,
-                              uint32_t page_size, VirtualHeap* parent_heap) {
+                              HeapType heap_type, uint32_t heap_base,
+                              uint32_t heap_size, uint32_t page_size,
+                              VirtualHeap* parent_heap) {
   uint32_t host_address_offset;
   if (heap_base >= 0xE0000000 &&
       xe::memory::allocation_granularity() > 0x1000) {
@@ -1367,8 +1375,8 @@ void PhysicalHeap::Initialize(Memory* memory, uint8_t* membase,
     host_address_offset = 0;
   }
 
-  BaseHeap::Initialize(memory, membase, heap_base, heap_size, page_size,
-                       host_address_offset);
+  BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size,
+                       page_size, host_address_offset);
   parent_heap_ = parent_heap;
   system_page_size_ = uint32_t(xe::memory::page_size());
 

@@ -184,7 +184,10 @@ X_STATUS Emulator::Setup(
   if (input_driver_factory) {
     auto input_drivers = input_driver_factory(display_window_);
     for (size_t i = 0; i < input_drivers.size(); ++i) {
-      input_system_->AddDriver(std::move(input_drivers[i]));
+      auto& input_driver = input_drivers[i];
+      input_driver->set_is_active_callback(
+          []() -> bool { return !xe::kernel::xam::xeXamIsUIActive(); });
+      input_system_->AddDriver(std::move(input_driver));
     }
   }
 
@@ -358,7 +361,7 @@ void Emulator::Pause() {
   auto lock = global_critical_region::AcquireDirect();
   auto threads =
       kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::kTypeThread);
+          kernel::XObject::Type::Thread);
   auto current_thread = kernel::XThread::IsInThread()
                             ? kernel::XThread::GetCurrentThread()
                             : nullptr;
@@ -388,7 +391,7 @@ void Emulator::Resume() {
 
   auto threads =
       kernel_state()->object_table()->GetObjectsByType<kernel::XThread>(
-          kernel::XObject::kTypeThread);
+          kernel::XObject::Type::Thread);
   for (auto thread : threads) {
     if (!thread->can_debugger_suspend()) {
       // Don't pause host threads.
@@ -513,7 +516,7 @@ bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
 bool Emulator::ExceptionCallback(Exception* ex) {
   // Check to see if the exception occurred in guest code.
   auto code_cache = processor()->backend()->code_cache();
-  auto code_base = code_cache->base_address();
+  auto code_base = code_cache->execute_base_address();
   auto code_end = code_base + code_cache->total_size();
 
   if (!processor()->is_debugger_attached() && debugging::IsDebuggerAttached()) {
