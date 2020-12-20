@@ -12,8 +12,8 @@
 
 #include <unordered_map>
 
-#include "third_party/xxhash/xxhash.h"
-
+#include "xenia/base/string_buffer.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/render_cache.h"
@@ -79,7 +79,7 @@ class PipelineCache {
   // state.
   VkPipeline GetPipeline(const RenderState* render_state, uint64_t hash_key);
 
-  bool TranslateShader(VulkanShader* shader, reg::SQ_PROGRAM_CNTL cntl);
+  bool TranslateShader(VulkanShader::VulkanTranslation& translation);
 
   void DumpShaderDisasmAMD(VkPipeline pipeline);
   void DumpShaderDisasmNV(const VkGraphicsPipelineCreateInfo& info);
@@ -92,6 +92,8 @@ class PipelineCache {
   RegisterFile* register_file_ = nullptr;
   ui::vulkan::VulkanDevice* device_ = nullptr;
 
+  // Temporary storage for AnalyzeUcode calls.
+  StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator.
   std::unique_ptr<ShaderTranslator> shader_translator_ = nullptr;
   // Disassembler used to get the SPIRV disasm. Only used in debug.
@@ -120,7 +122,7 @@ class PipelineCache {
   // Hash state used to incrementally produce pipeline hashes during update.
   // By the time the full update pass has run the hash will represent the
   // current state in a way that can uniquely identify the produced VkPipeline.
-  XXH64_state_t hash_state_;
+  XXH3_state_t hash_state_;
   // All previously generated pipelines mapped by hash.
   std::unordered_map<uint64_t, VkPipeline> cached_pipelines_;
 

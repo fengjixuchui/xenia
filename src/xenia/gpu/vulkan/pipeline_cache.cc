@@ -9,11 +9,11 @@
 
 #include "xenia/gpu/vulkan/pipeline_cache.h"
 
-#include "third_party/xxhash/xxhash.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/vulkan/vulkan_gpu_flags.h"
 
@@ -208,7 +208,8 @@ VulkanShader* PipelineCache::LoadShader(xenos::ShaderType shader_type,
                                         const uint32_t* host_address,
                                         uint32_t dword_count) {
   // Hash the input memory and lookup the shader.
-  uint64_t data_hash = XXH64(host_address, dword_count * sizeof(uint32_t), 0);
+  uint64_t data_hash =
+      XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
   auto it = shader_map_.find(data_hash);
   if (it != shader_map_.end()) {
     // Shader has been previously loaded.
@@ -259,7 +260,7 @@ PipelineCache::UpdateStatus PipelineCache::ConfigurePipeline(
   }
   if (!pipeline) {
     // Should have a hash key produced by the UpdateState pass.
-    uint64_t hash_key = XXH64_digest(&hash_state_);
+    uint64_t hash_key = XXH3_64bits_digest(&hash_state_);
     pipeline = GetPipeline(render_state, hash_key);
     current_pipeline_ = pipeline;
     if (!pipeline) {
@@ -362,35 +363,39 @@ VkPipeline PipelineCache::GetPipeline(const RenderState* render_state,
   return pipeline;
 }
 
-bool PipelineCache::TranslateShader(VulkanShader* shader,
-                                    reg::SQ_PROGRAM_CNTL cntl) {
+bool PipelineCache::TranslateShader(
+    VulkanShader::VulkanTranslation& translation) {
+  translation.shader().AnalyzeUcode(ucode_disasm_buffer_);
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
-  if (!shader_translator_->Translate(shader, cntl)) {
+  if (!shader_translator_->TranslateAnalyzedShader(translation)) {
     XELOGE("Shader translation failed; marking shader as ignored");
     return false;
   }
 
   // Prepare the shader for use (creates our VkShaderModule).
   // It could still fail at this point.
-  if (!shader->Prepare()) {
+  if (!translation.Prepare()) {
     XELOGE("Shader preparation failed; marking shader as ignored");
     return false;
   }
 
-  if (shader->is_valid()) {
+  if (translation.is_valid()) {
     XELOGGPU("Generated {} shader ({}b) - hash {:016X}:\n{}\n",
-             shader->type() == xenos::ShaderType::kVertex ? "vertex" : "pixel",
-             shader->ucode_dword_count() * 4, shader->ucode_data_hash(),
-             shader->ucode_disassembly());
+             translation.shader().type() == xenos::ShaderType::kVertex
+                 ? "vertex"
+                 : "pixel",
+             translation.shader().ucode_dword_count() * 4,
+             translation.shader().ucode_data_hash(),
+             translation.shader().ucode_disassembly());
   }
 
   // Dump shader files if desired.
   if (!cvars::dump_shaders.empty()) {
-    shader->Dump(cvars::dump_shaders, "vk");
+    translation.Dump(cvars::dump_shaders, "vk");
   }
 
-  return shader->is_valid();
+  return translation.is_valid();
 }
 
 static void DumpShaderStatisticsAMD(const VkShaderStatisticsInfoAMD& stats) {
@@ -958,7 +963,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateState(
   bool mismatch = false;
 
   // Reset hash so we can build it up.
-  XXH64_reset(&hash_state_, 0);
+  XXH3_64bits_reset(&hash_state_);
 
 #define CHECK_UPDATE_STATUS(status, mismatch, error_message) \
   {                                                          \
@@ -1025,7 +1030,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateRenderTargetState() {
   regs.rb_color1_info.color_format = cur_regs->rb_color1_info.color_format;
   regs.rb_color2_info.color_format = cur_regs->rb_color2_info.color_format;
   regs.rb_color3_info.color_format = cur_regs->rb_color3_info.color_format;
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
@@ -1058,21 +1063,37 @@ PipelineCache::UpdateStatus PipelineCache::UpdateShaderStages(
   regs.vertex_shader = vertex_shader;
   regs.pixel_shader = pixel_shader;
   regs.primitive_type = primitive_type;
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
 
-  if (!vertex_shader->is_translated() &&
-      !TranslateShader(vertex_shader, regs.sq_program_cntl)) {
+  VulkanShader::VulkanTranslation* vertex_shader_translation =
+      static_cast<VulkanShader::VulkanTranslation*>(
+          vertex_shader->GetOrCreateTranslation(
+              shader_translator_->GetDefaultModification(
+                  xenos::ShaderType::kVertex,
+                  vertex_shader->GetDynamicAddressableRegisterCount(
+                      regs.sq_program_cntl.vs_num_reg))));
+  if (!vertex_shader_translation->is_translated() &&
+      !TranslateShader(*vertex_shader_translation)) {
     XELOGE("Failed to translate the vertex shader!");
     return UpdateStatus::kError;
   }
 
-  if (pixel_shader && !pixel_shader->is_translated() &&
-      !TranslateShader(pixel_shader, regs.sq_program_cntl)) {
-    XELOGE("Failed to translate the pixel shader!");
-    return UpdateStatus::kError;
+  VulkanShader::VulkanTranslation* pixel_shader_translation = nullptr;
+  if (pixel_shader) {
+    pixel_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+        pixel_shader->GetOrCreateTranslation(
+            shader_translator_->GetDefaultModification(
+                xenos::ShaderType::kPixel,
+                pixel_shader->GetDynamicAddressableRegisterCount(
+                    regs.sq_program_cntl.ps_num_reg))));
+    if (!pixel_shader_translation->is_translated() &&
+        !TranslateShader(*pixel_shader_translation)) {
+      XELOGE("Failed to translate the pixel shader!");
+      return UpdateStatus::kError;
+    }
   }
 
   update_shader_stages_stage_count_ = 0;
@@ -1084,7 +1105,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateShaderStages(
   vertex_pipeline_stage.pNext = nullptr;
   vertex_pipeline_stage.flags = 0;
   vertex_pipeline_stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-  vertex_pipeline_stage.module = vertex_shader->shader_module();
+  vertex_pipeline_stage.module = vertex_shader_translation->shader_module();
   vertex_pipeline_stage.pName = "main";
   vertex_pipeline_stage.pSpecializationInfo = nullptr;
 
@@ -1116,8 +1137,9 @@ PipelineCache::UpdateStatus PipelineCache::UpdateShaderStages(
   pixel_pipeline_stage.pNext = nullptr;
   pixel_pipeline_stage.flags = 0;
   pixel_pipeline_stage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-  pixel_pipeline_stage.module =
-      pixel_shader ? pixel_shader->shader_module() : dummy_pixel_shader_;
+  pixel_pipeline_stage.module = pixel_shader_translation
+                                    ? pixel_shader_translation->shader_module()
+                                    : dummy_pixel_shader_;
   pixel_pipeline_stage.pName = "main";
   pixel_pipeline_stage.pSpecializationInfo = nullptr;
 
@@ -1132,7 +1154,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateVertexInputState(
   bool dirty = false;
   dirty |= vertex_shader != regs.vertex_shader;
   regs.vertex_shader = vertex_shader;
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
@@ -1161,7 +1183,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateInputAssemblyState(
   dirty |= SetShadowRegister(&regs.multi_prim_ib_reset_index,
                              XE_GPU_REG_VGT_MULTI_PRIM_IB_RESET_INDX);
   regs.primitive_type = primitive_type;
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
@@ -1287,7 +1309,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateRasterizationState(
     dirty = true;
   }
 
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
@@ -1369,7 +1391,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateMultisampleState() {
   dirty |= SetShadowRegister(&regs.pa_su_sc_mode_cntl,
                              XE_GPU_REG_PA_SU_SC_MODE_CNTL);
   dirty |= SetShadowRegister(&regs.rb_surface_info, XE_GPU_REG_RB_SURFACE_INFO);
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
@@ -1421,7 +1443,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateDepthStencilState() {
   dirty |= SetShadowRegister(&regs.rb_depthcontrol, XE_GPU_REG_RB_DEPTHCONTROL);
   dirty |=
       SetShadowRegister(&regs.rb_stencilrefmask, XE_GPU_REG_RB_STENCILREFMASK);
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }
@@ -1510,7 +1532,7 @@ PipelineCache::UpdateStatus PipelineCache::UpdateColorBlendState() {
   dirty |=
       SetShadowRegister(&regs.rb_blendcontrol[3], XE_GPU_REG_RB_BLENDCONTROL3);
   dirty |= SetShadowRegister(&regs.rb_modecontrol, XE_GPU_REG_RB_MODECONTROL);
-  XXH64_update(&hash_state_, &regs, sizeof(regs));
+  XXH3_64bits_update(&hash_state_, &regs, sizeof(regs));
   if (!dirty) {
     return UpdateStatus::kCompatible;
   }

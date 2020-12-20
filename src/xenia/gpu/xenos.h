@@ -305,6 +305,9 @@ enum class DepthRenderTargetFormat : uint32_t {
 
 const char* GetDepthRenderTargetFormatName(DepthRenderTargetFormat format);
 
+// Converts an IEEE-754 32-bit floating-point number to Xenos floating-point
+// depth, rounding to the nearest even.
+uint32_t Float32To20e4(float f32);
 // Converts Xenos floating-point depth in bits 0:23 (not clamping) to an
 // IEEE-754 32-bit floating-point number.
 float Float20e4To32(uint32_t f24);
@@ -540,33 +543,6 @@ inline int GetVertexFormatComponentCount(VertexFormat format) {
     default:
       assert_unhandled_case(format);
       return 0;
-  }
-}
-
-inline int GetVertexFormatSizeInWords(VertexFormat format) {
-  switch (format) {
-    case VertexFormat::k_8_8_8_8:
-    case VertexFormat::k_2_10_10_10:
-    case VertexFormat::k_10_11_11:
-    case VertexFormat::k_11_11_10:
-    case VertexFormat::k_16_16:
-    case VertexFormat::k_16_16_FLOAT:
-    case VertexFormat::k_32:
-    case VertexFormat::k_32_FLOAT:
-      return 1;
-    case VertexFormat::k_16_16_16_16:
-    case VertexFormat::k_16_16_16_16_FLOAT:
-    case VertexFormat::k_32_32:
-    case VertexFormat::k_32_32_FLOAT:
-      return 2;
-    case VertexFormat::k_32_32_32_FLOAT:
-      return 3;
-    case VertexFormat::k_32_32_32_32:
-    case VertexFormat::k_32_32_32_32_FLOAT:
-      return 4;
-    default:
-      assert_unhandled_case(format);
-      return 1;
   }
 }
 
@@ -1036,10 +1012,9 @@ XEPACKEDUNION(xe_gpu_texture_fetch_t, {
     ClampMode clamp_y : 3;                               // +13
     ClampMode clamp_z : 3;                               // +16
     SignedRepeatingFractionMode signed_rf_mode_all : 1;  // +19
-    // TODO(Triang3l): 1 or 2 dim_tbd bits?
-    uint32_t unk_0 : 2;  // +20
-    uint32_t pitch : 9;  // +22 byte_pitch >> 5
-    uint32_t tiled : 1;  // +31
+    uint32_t dim_tbd : 2;                                // +20
+    uint32_t pitch : 9;                                  // +22 byte_pitch >> 5
+    uint32_t tiled : 1;                                  // +31
 
     TextureFormat format : 6;           // +0 dword_1
     Endian endianness : 2;              // +6

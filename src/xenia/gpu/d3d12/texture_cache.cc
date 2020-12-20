@@ -9,8 +9,6 @@
 
 #include "xenia/gpu/d3d12/texture_cache.h"
 
-#include "third_party/xxhash/xxhash.h"
-
 #include <algorithm>
 #include <cfloat>
 #include <cstring>
@@ -21,6 +19,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/texture_info.h"
@@ -1335,8 +1334,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 bool TextureCache::AreActiveTextureSRVKeysUpToDate(
     const TextureSRVKey* keys,
     const D3D12Shader::TextureBinding* host_shader_bindings,
-    uint32_t host_shader_binding_count) const {
-  for (uint32_t i = 0; i < host_shader_binding_count; ++i) {
+    size_t host_shader_binding_count) const {
+  for (size_t i = 0; i < host_shader_binding_count; ++i) {
     const TextureSRVKey& key = keys[i];
     const TextureBinding& binding =
         texture_bindings_[host_shader_bindings[i].fetch_constant];
@@ -1351,8 +1350,8 @@ bool TextureCache::AreActiveTextureSRVKeysUpToDate(
 void TextureCache::WriteActiveTextureSRVKeys(
     TextureSRVKey* keys,
     const D3D12Shader::TextureBinding* host_shader_bindings,
-    uint32_t host_shader_binding_count) const {
-  for (uint32_t i = 0; i < host_shader_binding_count; ++i) {
+    size_t host_shader_binding_count) const {
+  for (size_t i = 0; i < host_shader_binding_count; ++i) {
     TextureSRVKey& key = keys[i];
     const TextureBinding& binding =
         texture_bindings_[host_shader_bindings[i].fetch_constant];

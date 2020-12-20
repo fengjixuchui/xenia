@@ -106,7 +106,7 @@ void DxbcShaderTranslator::ExportToMemory() {
                         kSysConst_Flags_Vec)
                 .Select(kSysConst_Flags_Comp),
             DxbcSrc::LU(kSysFlag_SharedMemoryIsUAV));
-  if (IsDxbcPixelShader()) {
+  if (is_pixel_shader()) {
     // Disable memexport in pixel shaders with supersampling since VPOS is
     // ambiguous.
     if (edram_rov_used_) {
@@ -136,7 +136,7 @@ void DxbcShaderTranslator::ExportToMemory() {
   DxbcOpIf(true, DxbcSrc::R(control_temp, DxbcSrc::kXXXX));
   // control_temp.x is now free.
 
-  for (uint32_t i = 0; i < kMaxMemExports; ++i) {
+  for (uint32_t i = 0; i < Shader::kMaxMemExports; ++i) {
     uint32_t eA_temp = system_temps_memexport_address_[i];
     if (eA_temp == UINT32_MAX) {
       // Export not used.

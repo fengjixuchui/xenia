@@ -11,8 +11,12 @@
 #define XENIA_GPU_SHADER_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
+#include <set>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "xenia/base/math.h"
@@ -589,8 +593,45 @@ struct ParsedAluInstruction {
   void Disassemble(StringBuffer* out) const;
 };
 
+void ParseControlFlowExec(const ucode::ControlFlowExecInstruction& cf,
+                          uint32_t cf_index, ParsedExecInstruction& instr);
+void ParseControlFlowCondExec(const ucode::ControlFlowCondExecInstruction& cf,
+                              uint32_t cf_index, ParsedExecInstruction& instr);
+void ParseControlFlowCondExecPred(
+    const ucode::ControlFlowCondExecPredInstruction& cf, uint32_t cf_index,
+    ParsedExecInstruction& instr);
+void ParseControlFlowLoopStart(const ucode::ControlFlowLoopStartInstruction& cf,
+                               uint32_t cf_index,
+                               ParsedLoopStartInstruction& instr);
+void ParseControlFlowLoopEnd(const ucode::ControlFlowLoopEndInstruction& cf,
+                             uint32_t cf_index,
+                             ParsedLoopEndInstruction& instr);
+void ParseControlFlowCondCall(const ucode::ControlFlowCondCallInstruction& cf,
+                              uint32_t cf_index, ParsedCallInstruction& instr);
+void ParseControlFlowReturn(const ucode::ControlFlowReturnInstruction& cf,
+                            uint32_t cf_index, ParsedReturnInstruction& instr);
+void ParseControlFlowCondJmp(const ucode::ControlFlowCondJmpInstruction& cf,
+                             uint32_t cf_index, ParsedJumpInstruction& instr);
+void ParseControlFlowAlloc(const ucode::ControlFlowAllocInstruction& cf,
+                           uint32_t cf_index, bool is_vertex_shader,
+                           ParsedAllocInstruction& instr);
+
+// Returns whether the fetch is a full one, and the next parsed mini vertex
+// fetch should inherit most of its parameters.
+bool ParseVertexFetchInstruction(
+    const ucode::VertexFetchInstruction& op,
+    const ucode::VertexFetchInstruction& previous_full_op,
+    ParsedVertexFetchInstruction& instr);
+void ParseTextureFetchInstruction(const ucode::TextureFetchInstruction& op,
+                                  ParsedTextureFetchInstruction& instr);
+void ParseAluInstruction(const ucode::AluInstruction& op,
+                         xenos::ShaderType shader_type,
+                         ParsedAluInstruction& instr);
+
 class Shader {
  public:
+  // Type of the vertex shader in a D3D11-like rendering pipeline - shader
+  // interface depends on in, so it must be known at translation time.
   // If values are changed, INVALIDATE SHADER STORAGES (increase their version
   // constexpr) where those are stored! And check bit count where this is
   // packed. This is : uint32_t for simplicity of packing in bit fields.
@@ -603,6 +644,8 @@ class Shader {
     kQuadDomainCPIndexed,
     kQuadDomainPatchIndexed,
   };
+  // For packing HostVertexShaderType in bit fields.
+  static constexpr uint32_t kHostVertexShaderTypeBitCount = 3;
 
   struct Error {
     bool is_fatal = false;
@@ -611,12 +654,8 @@ class Shader {
 
   struct VertexBinding {
     struct Attribute {
-      // Attribute index, 0-based in the entire shader.
-      int attrib_index;
       // Fetch instruction with all parameters.
       ParsedVertexFetchInstruction fetch_instr;
-      // Size of the attribute, in words.
-      uint32_t size_words;
     };
 
     // Index within the vertex binding listing.
@@ -683,6 +722,71 @@ class Shader {
     }
   };
 
+  // Based on the number of AS_VS/PS_EXPORT_STREAM_* enum sets found in a game
+  // .pdb.
+  static constexpr uint32_t kMaxMemExports = 16;
+
+  class Translation {
+   public:
+    virtual ~Translation() {}
+
+    Shader& shader() const { return shader_; }
+
+    // Translator-specific modification bits.
+    uint64_t modification() const { return modification_; }
+
+    // True if the shader was translated and prepared without error.
+    bool is_valid() const { return is_valid_; }
+
+    // True if the shader has already been translated.
+    bool is_translated() const { return is_translated_; }
+
+    // Errors that occurred during translation.
+    const std::vector<Error>& errors() const { return errors_; }
+
+    // Translated shader binary (or text).
+    const std::vector<uint8_t>& translated_binary() const {
+      return translated_binary_;
+    }
+
+    // Gets the translated shader binary as a string.
+    // This is only valid if it is actually text.
+    std::string GetTranslatedBinaryString() const;
+
+    // Disassembly of the translated from the host graphics layer.
+    // May be empty if the host does not support disassembly.
+    const std::string& host_disassembly() const { return host_disassembly_; }
+
+    // In case disassembly depends on the GPU backend, for setting it
+    // externally.
+    void set_host_disassembly(std::string disassembly) {
+      host_disassembly_ = std::move(disassembly);
+    }
+
+    // For dumping after translation. Dumps the shader's disassembled microcode,
+    // translated code, and, if available, translated disassembly, to a file in
+    // the given path based on ucode hash. Returns the name of the written file.
+    std::filesystem::path Dump(const std::filesystem::path& base_path,
+                               const char* path_prefix);
+
+   protected:
+    Translation(Shader& shader, uint64_t modification)
+        : shader_(shader), modification_(modification) {}
+
+   private:
+    friend class Shader;
+    friend class ShaderTranslator;
+
+    Shader& shader_;
+    uint64_t modification_;
+
+    bool is_valid_ = false;
+    bool is_translated_ = false;
+    std::vector<Error> errors_;
+    std::vector<uint8_t> translated_binary_;
+    std::string host_disassembly_;
+  };
+
   Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
          const uint32_t* ucode_dwords, size_t ucode_dword_count);
   virtual ~Shader();
@@ -690,27 +794,29 @@ class Shader {
   // Whether the shader is identified as a vertex or pixel shader.
   xenos::ShaderType type() const { return shader_type_; }
 
-  // If this is a vertex shader, and it has been translated, type of the shader
-  // in a D3D11-like rendering pipeline - shader interface depends on in, so it
-  // must be known at translation time.
-  HostVertexShaderType host_vertex_shader_type() const {
-    return host_vertex_shader_type_;
-  }
-
   // Microcode dwords in host endianness.
   const std::vector<uint32_t>& ucode_data() const { return ucode_data_; }
   uint64_t ucode_data_hash() const { return ucode_data_hash_; }
   const uint32_t* ucode_dwords() const { return ucode_data_.data(); }
   size_t ucode_dword_count() const { return ucode_data_.size(); }
 
+  bool is_ucode_analyzed() const { return is_ucode_analyzed_; }
+  // ucode_disasm_buffer is temporary storage for disassembly (provided
+  // externally so it won't need to be reallocated for every shader).
+  void AnalyzeUcode(StringBuffer& ucode_disasm_buffer);
+
+  // The following parameters, until the translation, are valid if ucode
+  // information has been gathered.
+
+  // Microcode disassembly in D3D format.
+  const std::string& ucode_disassembly() const { return ucode_disassembly_; }
+
   // All vertex bindings used in the shader.
-  // Valid for vertex shaders only.
   const std::vector<VertexBinding>& vertex_bindings() const {
     return vertex_bindings_;
   }
 
   // All texture bindings used in the shader.
-  // Valid for both vertex and pixel shaders.
   const std::vector<TextureBinding>& texture_bindings() const {
     return texture_bindings_;
   }
@@ -720,86 +826,178 @@ class Shader {
     return constant_register_map_;
   }
 
+  // uint5[Shader::kMaxMemExports] - bits indicating which eM# registers have
+  // been written to after each `alloc export`, for up to Shader::kMaxMemExports
+  // exports. This will contain zero for certain corrupt exports - for those to
+  // which a valid eA was not written via a MAD with a stream constant.
+  const uint8_t* memexport_eM_written() const { return memexport_eM_written_; }
+
   // All c# registers used as the addend in MAD operations to eA.
-  const std::vector<uint32_t>& memexport_stream_constants() const {
+  const std::set<uint32_t>& memexport_stream_constants() const {
     return memexport_stream_constants_;
   }
 
-  // Returns true if the given color target index [0-3].
-  bool writes_color_target(uint32_t i) const {
-    return writes_color_targets_[i];
+  // Labels that jumps (explicit or from loops) can be done to.
+  const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
+
+  // Exclusive upper bound of the indexes of paired control flow instructions
+  // (each corresponds to 3 dwords).
+  uint32_t cf_pair_index_bound() const { return cf_pair_index_bound_; }
+
+  // Upper bound of temporary registers addressed statically by the shader -
+  // highest static register address + 1, or 0 if no registers referenced this
+  // way. SQ_PROGRAM_CNTL is not always reliable - some draws (like single point
+  // draws with oPos = 0001 that are done by Xbox 360's Direct3D 9 sometimes;
+  // can be reproduced by launching Arrival in Halo 3 from the campaign lobby)
+  // that aren't supposed to cover any pixels use an invalid (zero)
+  // SQ_PROGRAM_CNTL, but with an outdated pixel shader loaded, in this case
+  // SQ_PROGRAM_CNTL may contain a number smaller than actually needed by the
+  // pixel shader - SQ_PROGRAM_CNTL should be used to go above this count if
+  // uses_register_dynamic_addressing is true.
+  uint32_t register_static_address_bound() const {
+    return register_static_address_bound_;
   }
+
+  // Whether the shader addresses temporary registers dynamically, thus
+  // SQ_PROGRAM_CNTL should determine the number of registers to use, not only
+  // register_static_address_bound.
+  bool uses_register_dynamic_addressing() const {
+    return uses_register_dynamic_addressing_;
+  }
+
+  // For building shader modification bits (and also for normalization of them),
+  // returns the amount of temporary registers that need to be allocated
+  // explicitly - if not using register dynamic addressing, the shader
+  // translator will use register_static_address_bound directly.
+  uint32_t GetDynamicAddressableRegisterCount(
+      uint32_t program_cntl_num_reg) const {
+    if (!uses_register_dynamic_addressing()) {
+      return 0;
+    }
+    return std::max((program_cntl_num_reg & 0x80)
+                        ? uint32_t(0)
+                        : (program_cntl_num_reg + uint32_t(1)),
+                    register_static_address_bound());
+  }
+
+  // True if the current shader has any `kill` instructions.
+  bool kills_pixels() const { return kills_pixels_; }
 
   // True if the shader overrides the pixel depth.
   bool writes_depth() const { return writes_depth_; }
 
-  // True if Xenia can automatically enable early depth/stencil for the pixel
-  // shader when RB_DEPTHCONTROL EARLY_Z_ENABLE is not set, provided alpha
-  // testing and alpha to coverage are disabled.
-  bool implicit_early_z_allowed() const { return implicit_early_z_allowed_; }
-
-  // True if the shader was translated and prepared without error.
-  bool is_valid() const { return is_valid_; }
-
-  // True if the shader has already been translated.
-  bool is_translated() const { return is_translated_; }
-
-  // Errors that occurred during translation.
-  const std::vector<Error>& errors() const { return errors_; }
-
-  // Microcode disassembly in D3D format.
-  const std::string& ucode_disassembly() const { return ucode_disassembly_; }
-
-  // Translated shader binary (or text).
-  const std::vector<uint8_t>& translated_binary() const {
-    return translated_binary_;
+  // Whether the shader can have early depth and stencil writing enabled, unless
+  // alpha test or alpha to coverage is enabled.
+  bool implicit_early_z_write_allowed() const {
+    // TODO(Triang3l): Investigate what happens to memexport when the pixel
+    // fails the depth/stencil test, but in Direct3D 11 UAV writes disable early
+    // depth/stencil.
+    return !writes_depth() && !kills_pixels() &&
+           memexport_stream_constants().empty();
   }
 
-  // Gets the translated shader binary as a string.
-  // This is only valid if it is actually text.
-  std::string GetTranslatedBinaryString() const;
+  // Whether each color render target is written to on any exection path.
+  uint32_t writes_color_targets() const { return writes_color_targets_; }
+  bool writes_color_target(uint32_t i) const {
+    return (writes_color_targets() & (uint32_t(1) << i)) != 0;
+  }
 
-  // Disassembly of the translated from the host graphics layer.
-  // May be empty if the host does not support disassembly.
-  const std::string& host_disassembly() const { return host_disassembly_; }
-  // A lot of errors that occurred during preparation of the host shader.
-  const std::string& host_error_log() const { return host_error_log_; }
-  // Host binary that can be saved and reused across runs.
-  // May be empty if the host does not support saving binaries.
-  const std::vector<uint8_t>& host_binary() const { return host_binary_; }
+  // Host translations with the specified modification bits. Not thread-safe
+  // with respect to translation creation/destruction.
+  const std::unordered_map<uint64_t, Translation*>& translations() const {
+    return translations_;
+  }
+  Translation* GetTranslation(uint64_t modification) const {
+    auto it = translations_.find(modification);
+    if (it != translations_.cend()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+  Translation* GetOrCreateTranslation(uint64_t modification,
+                                      bool* is_new = nullptr);
+  // For shader storage loading, to remove a modification in case of translation
+  // failure. Not thread-safe.
+  void DestroyTranslation(uint64_t modification);
 
-  // Dumps the shader to a file in the given path based on ucode hash.
-  // Both the ucode binary and disassembled and translated shader will be
-  // written.
-  // Returns the filename of the shader and the binary.
-  std::pair<std::filesystem::path, std::filesystem::path> Dump(
-      const std::filesystem::path& base_path, const char* path_prefix);
+  // An externally managed identifier of the shader storage the microcode of the
+  // shader was last written to, or was loaded from, to only write the shader
+  // microcode to the storage once. UINT32_MAX by default.
+  uint32_t ucode_storage_index() const { return ucode_storage_index_; }
+  void set_ucode_storage_index(uint32_t storage_index) {
+    ucode_storage_index_ = storage_index;
+  }
+
+  // Dumps the shader's microcode binary to a file in the given path based on
+  // ucode hash. Returns the name of the written file. Can be called at any
+  // time, doesn't require the shader to be translated.
+  std::filesystem::path DumpUcodeBinary(const std::filesystem::path& base_path);
 
  protected:
   friend class ShaderTranslator;
 
+  virtual Translation* CreateTranslationInstance(uint64_t modification);
+
   xenos::ShaderType shader_type_;
-  HostVertexShaderType host_vertex_shader_type_ = HostVertexShaderType::kVertex;
   std::vector<uint32_t> ucode_data_;
   uint64_t ucode_data_hash_;
 
+  // Whether info needed before translating has been gathered already - may be
+  // needed to determine which modifications are actually needed and make sense
+  // (for instance, there may be draws not covering anything and not allocating
+  // any pixel shader registers in SQ_PROGRAM_CNTL, but still using the pixel
+  // shader from the previous draw - in this case, every shader that happens to
+  // be before such draw will need to be translated again with a different
+  // dynamically addressed register count, which may cause compilation of
+  // different random pipelines across many random frames, thus causing
+  // stuttering - normally host pipeline states are deterministically only
+  // compiled when a new material appears in the game, and having the order of
+  // draws also matter in such unpredictable way would break this rule; limit
+  // the effect to shaders with dynamic register addressing only, which are
+  // extremely rare), also some info needed for drawing is collected during the
+  // ucode analysis.
+  bool is_ucode_analyzed_ = false;
+
+  std::string ucode_disassembly_;
   std::vector<VertexBinding> vertex_bindings_;
   std::vector<TextureBinding> texture_bindings_;
   ConstantRegisterMap constant_register_map_ = {0};
-  bool writes_color_targets_[4] = {false, false, false, false};
+  uint8_t memexport_eM_written_[kMaxMemExports] = {};
+  std::set<uint32_t> memexport_stream_constants_;
+  std::set<uint32_t> label_addresses_;
+  uint32_t cf_pair_index_bound_ = 0;
+  uint32_t register_static_address_bound_ = 0;
+  bool uses_register_dynamic_addressing_ = false;
+  bool kills_pixels_ = false;
   bool writes_depth_ = false;
-  bool implicit_early_z_allowed_ = true;
-  std::vector<uint32_t> memexport_stream_constants_;
+  uint32_t writes_color_targets_ = 0b0000;
 
-  bool is_valid_ = false;
-  bool is_translated_ = false;
-  std::vector<Error> errors_;
+  // Modification bits -> translation.
+  std::unordered_map<uint64_t, Translation*> translations_;
 
-  std::string ucode_disassembly_;
-  std::vector<uint8_t> translated_binary_;
-  std::string host_disassembly_;
-  std::string host_error_log_;
-  std::vector<uint8_t> host_binary_;
+  uint32_t ucode_storage_index_ = UINT32_MAX;
+
+ private:
+  void GatherExecInformation(
+      const ParsedExecInstruction& instr,
+      ucode::VertexFetchInstruction& previous_vfetch_full,
+      uint32_t& unique_texture_bindings, uint32_t memexport_alloc_current_count,
+      uint32_t& memexport_eA_written, StringBuffer& ucode_disasm_buffer);
+  void GatherVertexFetchInformation(
+      const ucode::VertexFetchInstruction& op,
+      ucode::VertexFetchInstruction& previous_vfetch_full,
+      StringBuffer& ucode_disasm_buffer);
+  void GatherTextureFetchInformation(const ucode::TextureFetchInstruction& op,
+                                     uint32_t& unique_texture_bindings,
+                                     StringBuffer& ucode_disasm_buffer);
+  void GatherAluInstructionInformation(const ucode::AluInstruction& op,
+                                       uint32_t memexport_alloc_current_count,
+                                       uint32_t& memexport_eA_written,
+                                       StringBuffer& ucode_disasm_buffer);
+  void GatherOperandInformation(const InstructionOperand& operand);
+  void GatherFetchResultInformation(const InstructionResult& result);
+  void GatherAluResultInformation(const InstructionResult& result,
+                                  uint32_t memexport_alloc_current_count);
 };
 
 }  // namespace gpu

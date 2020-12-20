@@ -18,6 +18,7 @@
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/d3d12/texture_cache.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
@@ -259,12 +260,16 @@ class RenderTargetCache {
   void Shutdown();
   void ClearCache();
 
+  flags::DepthFloat24Conversion depth_float24_conversion() const {
+    return depth_float24_conversion_;
+  }
+
   void CompletedSubmissionUpdated();
   void BeginSubmission();
   void EndFrame();
   // Called in the beginning of a draw call - may bind pipelines and change the
   // view descriptor heap.
-  bool UpdateRenderTargets(const D3D12Shader* pixel_shader);
+  bool UpdateRenderTargets(uint32_t shader_writes_color_targets);
   // Returns the host-to-guest mappings and host formats of currently bound
   // render targets for pipeline creation and remapping in shaders. They are
   // consecutive, and format DXGI_FORMAT_UNKNOWN terminates the list. Depth
@@ -318,6 +323,7 @@ class RenderTargetCache {
     kColor7e3,
     kDepthUnorm,
     kDepthFloat,
+    kDepthFloat24And32,
 
     kCount
   };
@@ -424,7 +430,7 @@ class RenderTargetCache {
                                          uint32_t instance);
 #endif
 
-  static EdramLoadStoreMode GetLoadStoreMode(bool is_depth, uint32_t format);
+  EdramLoadStoreMode GetLoadStoreMode(bool is_depth, uint32_t format) const;
 
   // Must be in a frame to call. Stores the dirty areas of the currently bound
   // render targets and marks them as clean.
@@ -441,6 +447,9 @@ class RenderTargetCache {
   TraceWriter& trace_writer_;
   bool bindless_resources_used_;
   bool edram_rov_used_;
+
+  // 20e4 depth conversion mode to use for non-ROV output.
+  flags::DepthFloat24Conversion depth_float24_conversion_;
 
   // Whether 1 guest pixel is rendered as 2x2 host pixels (currently only
   // supported with ROV).

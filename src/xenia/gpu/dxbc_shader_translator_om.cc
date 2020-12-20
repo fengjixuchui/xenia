@@ -144,7 +144,7 @@ void DxbcShaderTranslator::ROV_GetColorFormatSystemConstants(
 }
 
 void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
-  bool color_targets_written = writes_any_color_target();
+  bool any_color_targets_written = current_shader().writes_color_targets() != 0;
 
   // ***************************************************************************
   // Get EDRAM offsets for the pixel:
@@ -167,7 +167,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // bigger) to integer to system_temp_rov_params_.zw.
   // system_temp_rov_params_.z = X host pixel position as uint
   // system_temp_rov_params_.w = Y host pixel position as uint
-  in_position_xy_used_ = true;
+  in_position_used_ |= 0b0011;
   DxbcOpFToU(DxbcDest::R(system_temp_rov_params_, 0b1100),
              DxbcSrc::V(uint32_t(InOutRegister::kPSInPosition), 0b01000000));
   // Revert the resolution scale to convert the position to guest pixels.
@@ -272,7 +272,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   DxbcOpIAdd(DxbcDest::R(system_temp_rov_params_, 0b0001),
              DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kZZZZ),
              DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kXXXX));
-  if (color_targets_written) {
+  if (any_color_targets_written) {
     // Write 32bpp color offset to system_temp_rov_params_.z.
     // system_temp_rov_params_.x = X sample 0 position within the depth tile
     // system_temp_rov_params_.y = row offset
@@ -303,8 +303,8 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // Release resolution_scale_log2_temp.
   PopSystemTemp();
   {
-    DxbcDest offsets_dest(DxbcDest::R(system_temp_rov_params_,
-                                      color_targets_written ? 0b0110 : 0b0010));
+    DxbcDest offsets_dest(DxbcDest::R(
+        system_temp_rov_params_, any_color_targets_written ? 0b0110 : 0b0010));
     // Scale the offsets by the resolution scale.
     // system_temp_rov_params_.y = scaled 32bpp depth/stencil first host pixel
     //                             address
@@ -315,7 +315,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
     // Add host pixel offsets.
     // system_temp_rov_params_.y = scaled 32bpp depth/stencil address
     // system_temp_rov_params_.z = scaled 32bpp color offset if needed
-    in_position_xy_used_ = true;
+    in_position_used_ |= 0b0011;
     for (uint32_t i = 0; i < 2; ++i) {
       // Convert a position component to integer.
       DxbcOpFToU(DxbcDest::R(system_temp_rov_params_, 0b0001),
@@ -329,7 +329,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // Close the resolution scale conditional.
   DxbcOpEndIf();
 
-  if (color_targets_written) {
+  if (any_color_targets_written) {
     // Get the 64bpp color offset to system_temp_rov_params_.w.
     // TODO(Triang3l): Find some game that aliases 64bpp with 32bpp to emulate
     // the real layout.
@@ -388,8 +388,6 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
 }
 
 void DxbcShaderTranslator::ROV_DepthStencilTest() {
-  bool depth_stencil_early = ROV_IsDepthStencilEarly();
-
   uint32_t temp = PushSystemTemp();
   DxbcDest temp_x_dest(DxbcDest::R(temp, 0b0001));
   DxbcSrc temp_x_src(DxbcSrc::R(temp, DxbcSrc::kXXXX));
@@ -413,27 +411,57 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
   // temp.x = free
   DxbcOpIf(true, temp_x_src);
 
+  bool depth_stencil_early = ROV_IsDepthStencilEarly();
+  bool shader_writes_depth = current_shader().writes_depth();
+
   for (uint32_t i = 0; i < 4; ++i) {
     // With early depth/stencil, depth/stencil writing may be deferred to the
     // end of the shader to prevent writing in case something (like alpha test,
     // which is dynamic GPU state) discards the pixel. So, write directly to the
-    // persistent register, system_temp_rov_depth_stencil_, instead of a local
+    // persistent register, system_temp_depth_stencil_, instead of a local
     // temporary register.
     DxbcDest sample_depth_stencil_dest(
-        depth_stencil_early
-            ? DxbcDest::R(system_temp_rov_depth_stencil_, 1 << i)
-            : temp_x_dest);
+        depth_stencil_early ? DxbcDest::R(system_temp_depth_stencil_, 1 << i)
+                            : temp_x_dest);
     DxbcSrc sample_depth_stencil_src(
-        depth_stencil_early
-            ? DxbcSrc::R(system_temp_rov_depth_stencil_).Select(i)
-            : temp_x_src);
+        depth_stencil_early ? DxbcSrc::R(system_temp_depth_stencil_).Select(i)
+                            : temp_x_src);
 
     if (!i) {
-      if (writes_depth()) {
+      if (shader_writes_depth) {
+        // Clamp oDepth to the lower viewport depth bound (depth clamp happens
+        // after the pixel shader in the pipeline, at least on Direct3D 11 and
+        // Vulkan, thus applies to the shader's depth output too).
+        system_constants_used_ |= 1ull << kSysConst_EdramDepthRange_Index;
+        DxbcOpMax(DxbcDest::R(system_temp_depth_stencil_, 0b0001),
+                  DxbcSrc::R(system_temp_depth_stencil_, DxbcSrc::kXXXX),
+                  DxbcSrc::CB(cbuffer_index_system_constants_,
+                              uint32_t(CbufferRegister::kSystemConstants),
+                              kSysConst_EdramDepthRange_Vec)
+                      .Select(kSysConst_EdramDepthRangeOffset_Comp));
+        // Calculate the upper Z range bound to temp.x for clamping after
+        // biasing.
+        // temp.x = viewport maximum depth
+        system_constants_used_ |= 1ull << kSysConst_EdramDepthRange_Index;
+        DxbcOpAdd(temp_x_dest,
+                  DxbcSrc::CB(cbuffer_index_system_constants_,
+                              uint32_t(CbufferRegister::kSystemConstants),
+                              kSysConst_EdramDepthRange_Vec)
+                      .Select(kSysConst_EdramDepthRangeOffset_Comp),
+                  DxbcSrc::CB(cbuffer_index_system_constants_,
+                              uint32_t(CbufferRegister::kSystemConstants),
+                              kSysConst_EdramDepthRange_Vec)
+                      .Select(kSysConst_EdramDepthRangeScale_Comp));
+        // Clamp oDepth to the upper viewport depth bound (already not above 1,
+        // but saturate for total safety).
+        // temp.x = free
+        DxbcOpMin(DxbcDest::R(system_temp_depth_stencil_, 0b0001),
+                  DxbcSrc::R(system_temp_depth_stencil_, DxbcSrc::kXXXX),
+                  temp_x_src, true);
         // Convert the shader-generated depth to 24-bit, using temp.x as
         // temporary.
-        ROV_DepthTo24Bit(system_temp_rov_depth_stencil_, 0,
-                         system_temp_rov_depth_stencil_, 0, temp, 0);
+        ROV_DepthTo24Bit(system_temp_depth_stencil_, 0,
+                         system_temp_depth_stencil_, 0, temp, 0);
       } else {
         // Load the first sample's Z*W and W to temp.xy - need this regardless
         // of coverage for polygon offset.
@@ -529,24 +557,24 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     }
 
     // Get if the current sample is covered to temp.w.
-    // temp.x = first sample's viewport space Z or 24-bit oDepth
+    // temp.x = first sample's viewport space Z if not writing to oDepth
     // temp.y = polygon offset if not writing to oDepth
     // temp.z = viewport maximum depth if not writing to oDepth
     // temp.w = coverage of the current sample
     DxbcOpAnd(temp_w_dest, DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kXXXX),
               DxbcSrc::LU(1 << i));
     // Check if the current sample is covered. Release 1 VGPR.
-    // temp.x = first sample's viewport space Z or 24-bit oDepth
+    // temp.x = first sample's viewport space Z if not writing to oDepth
     // temp.y = polygon offset if not writing to oDepth
     // temp.z = viewport maximum depth if not writing to oDepth
     // temp.w = free
     DxbcOpIf(true, temp_w_src);
 
-    if (writes_depth()) {
+    if (shader_writes_depth) {
       // Copy the 24-bit depth common to all samples to sample_depth_stencil.
       // temp.x = shader-generated 24-bit depth
       DxbcOpMov(sample_depth_stencil_dest,
-                DxbcSrc::R(system_temp_rov_depth_stencil_, DxbcSrc::kXXXX));
+                DxbcSrc::R(system_temp_depth_stencil_, DxbcSrc::kXXXX));
     } else {
       if (i) {
         // Sample's depth precalculated for sample 0 (for slope-scaled depth
@@ -997,51 +1025,61 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     // temp.z = viewport maximum depth if not writing to oDepth
     // temp.w = whether depth/stencil has been modified
     DxbcOpINE(temp_w_dest, sample_depth_stencil_src, temp_w_src);
-    // Check if need to write.
-    // temp.x? = resulting sample depth/stencil
-    // temp.y = polygon offset if not writing to oDepth
-    // temp.z = viewport maximum depth if not writing to oDepth
-    // temp.w = free
-    DxbcOpIf(true, temp_w_src);
-    {
-      if (depth_stencil_early) {
-        // Get if early depth/stencil write is enabled to temp.w.
-        // temp.w = whether early depth/stencil write is enabled
-        system_constants_used_ |= 1ull << kSysConst_Flags_Index;
-        DxbcOpAnd(temp_w_dest,
-                  DxbcSrc::CB(cbuffer_index_system_constants_,
-                              uint32_t(CbufferRegister::kSystemConstants),
-                              kSysConst_Flags_Vec)
-                      .Select(kSysConst_Flags_Comp),
-                  DxbcSrc::LU(kSysFlag_ROVDepthStencilEarlyWrite));
-        // Check if need to write early.
-        // temp.w = free
-        DxbcOpIf(true, temp_w_src);
+    if (depth_stencil_early &&
+        !current_shader().implicit_early_z_write_allowed()) {
+      // Set the sample bit in bits 4:7 of system_temp_rov_params_.x - always
+      // need to write late in this shader, as it may do something like
+      // explicitly killing pixels.
+      DxbcOpBFI(DxbcDest::R(system_temp_rov_params_, 0b0001), DxbcSrc::LU(1),
+                DxbcSrc::LU(4 + i), temp_w_src,
+                DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kXXXX));
+    } else {
+      // Check if need to write.
+      // temp.x? = resulting sample depth/stencil
+      // temp.y = polygon offset if not writing to oDepth
+      // temp.z = viewport maximum depth if not writing to oDepth
+      // temp.w = free
+      DxbcOpIf(true, temp_w_src);
+      {
+        if (depth_stencil_early) {
+          // Get if early depth/stencil write is enabled to temp.w.
+          // temp.w = whether early depth/stencil write is enabled
+          system_constants_used_ |= 1ull << kSysConst_Flags_Index;
+          DxbcOpAnd(temp_w_dest,
+                    DxbcSrc::CB(cbuffer_index_system_constants_,
+                                uint32_t(CbufferRegister::kSystemConstants),
+                                kSysConst_Flags_Vec)
+                        .Select(kSysConst_Flags_Comp),
+                    DxbcSrc::LU(kSysFlag_ROVDepthStencilEarlyWrite));
+          // Check if need to write early.
+          // temp.w = free
+          DxbcOpIf(true, temp_w_src);
+        }
+        // Write the new depth/stencil.
+        if (uav_index_edram_ == kBindingIndexUnallocated) {
+          uav_index_edram_ = uav_count_++;
+        }
+        DxbcOpStoreUAVTyped(
+            DxbcDest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
+            DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kYYYY), 1,
+            sample_depth_stencil_src);
+        if (depth_stencil_early) {
+          // Need to still run the shader to know whether to write the
+          // depth/stencil value.
+          DxbcOpElse();
+          // Set the sample bit in bits 4:7 of system_temp_rov_params_.x if need
+          // to write later (after checking if the sample is not discarded by a
+          // kill instruction, alphatest or alpha-to-coverage).
+          DxbcOpOr(DxbcDest::R(system_temp_rov_params_, 0b0001),
+                   DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kXXXX),
+                   DxbcSrc::LU(1 << (4 + i)));
+          // Close the early depth/stencil check.
+          DxbcOpEndIf();
+        }
       }
-      // Write the new depth/stencil.
-      if (uav_index_edram_ == kBindingIndexUnallocated) {
-        uav_index_edram_ = uav_count_++;
-      }
-      DxbcOpStoreUAVTyped(
-          DxbcDest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
-          DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kYYYY), 1,
-          sample_depth_stencil_src);
-      if (depth_stencil_early) {
-        // Need to still run the shader to know whether to write the
-        // depth/stencil value.
-        DxbcOpElse();
-        // Set sample bit out of bits 4:7 of system_temp_rov_params_.x if need
-        // to write later (after checking if the sample is not discarded by a
-        // kill instruction, alphatest or alpha-to-coverage).
-        DxbcOpOr(DxbcDest::R(system_temp_rov_params_, 0b0001),
-                 DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kXXXX),
-                 DxbcSrc::LU(1 << (4 + i)));
-        // Close the early depth/stencil check.
-        DxbcOpEndIf();
-      }
+      // Close the write check.
+      DxbcOpEndIf();
     }
-    // Close the write check.
-    DxbcOpEndIf();
 
     // Release sample_temp.
     PopSystemTemp();
@@ -1698,7 +1736,7 @@ void DxbcShaderTranslator::ROV_HandleAlphaBlendFactorCases(
 
 void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs_AlphaToMask() {
   // Check if alpha to coverage can be done at all in this shader.
-  if (!writes_color_target(0)) {
+  if (!current_shader().writes_color_target(0)) {
     return;
   }
 
@@ -1720,7 +1758,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs_AlphaToMask() {
   // Convert SSAA sample position to integer to temp.xy (not caring about the
   // resolution scale because it's not supported anywhere on the RTV output
   // path).
-  in_position_xy_used_ = true;
+  in_position_used_ |= 0b0011;
   DxbcOpFToU(DxbcDest::R(temp, 0b0011),
              DxbcSrc::V(uint32_t(InOutRegister::kPSInPosition)));
 
@@ -1827,21 +1865,22 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs_AlphaToMask() {
 }
 
 void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
-  if (!writes_any_color_target()) {
+  uint32_t shader_writes_color_targets =
+      current_shader().writes_color_targets();
+  if (!shader_writes_color_targets) {
     return;
   }
 
   // Check if this sample needs to be discarded by alpha to coverage.
   CompletePixelShader_WriteToRTVs_AlphaToMask();
 
-  // Get the write mask as components, and also apply the exponent bias after
-  // alpha to coverage because it needs the unbiased alpha from the shader.
-  uint32_t guest_rt_mask = 0;
+  uint32_t gamma_temp = PushSystemTemp();
   for (uint32_t i = 0; i < 4; ++i) {
-    if (!writes_color_target(i)) {
+    if (!(shader_writes_color_targets & (1 << i))) {
       continue;
     }
-    guest_rt_mask |= 1 << i;
+    // Apply the exponent bias after alpha to coverage because it needs the
+    // unbiased alpha from the shader
     system_constants_used_ |= 1ull << kSysConst_ColorExpBias_Index;
     DxbcOpMul(DxbcDest::R(system_temps_color_[i]),
               DxbcSrc::R(system_temps_color_[i]),
@@ -1849,16 +1888,9 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
                           uint32_t(CbufferRegister::kSystemConstants),
                           kSysConst_ColorExpBias_Vec)
                   .Select(i));
-  }
-
-  // Convert to gamma space - this is incorrect, since it must be done after
-  // blending on the Xbox 360, but this is just one of many blending issues in
-  // the RTV path.
-  uint32_t gamma_temp = PushSystemTemp();
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (!(guest_rt_mask & (1 << i))) {
-      continue;
-    }
+    // Convert to gamma space - this is incorrect, since it must be done after
+    // blending on the Xbox 360, but this is just one of many blending issues in
+    // the RTV path.
     system_constants_used_ |= 1ull << kSysConst_Flags_Index;
     DxbcOpAnd(DxbcDest::R(gamma_temp, 0b0001),
               DxbcSrc::CB(cbuffer_index_system_constants_,
@@ -1887,7 +1919,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
   // Host RT i, guest RT j.
   for (uint32_t i = 0; i < 4; ++i) {
     // mask = map.iiii == (0, 1, 2, 3)
-    DxbcOpIEq(DxbcDest::R(remap_movc_mask_temp, guest_rt_mask),
+    DxbcOpIEq(DxbcDest::R(remap_movc_mask_temp, shader_writes_color_targets),
               DxbcSrc::CB(cbuffer_index_system_constants_,
                           uint32_t(CbufferRegister::kSystemConstants),
                           kSysConst_ColorOutputMap_Vec)
@@ -1896,7 +1928,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
     bool guest_rt_first = true;
     for (uint32_t j = 0; j < 4; ++j) {
       // If map.i == j, move guest color j to the temporary host color.
-      if (!(guest_rt_mask & (1 << j))) {
+      if (!(shader_writes_color_targets & (1 << j))) {
         continue;
       }
       DxbcOpMovC(DxbcDest::R(remap_movc_target_temp),
@@ -1911,6 +1943,141 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
   }
   // Release remap_movc_mask_temp and remap_movc_target_temp.
   PopSystemTemp(2);
+}
+
+void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
+  if (!DSV_IsWritingFloat24Depth()) {
+    return;
+  }
+
+  bool shader_writes_depth = current_shader().writes_depth();
+
+  uint32_t temp;
+  if (shader_writes_depth) {
+    // The depth is already written to system_temp_depth_stencil_.x and clamped
+    // to 0...1 with NaNs dropped (saturating in StoreResult); yzw are free.
+    temp = system_temp_depth_stencil_;
+  } else {
+    // Need a temporary variable; copy the sample's depth input to it and
+    // saturate it (in Direct3D 11, depth is clamped to the viewport bounds
+    // after the pixel shader, and SV_Position.z contains the unclamped depth,
+    // which may be outside the viewport's depth range if it's biased); though
+    // it will be clamped to the viewport bounds anyway, but to be able to make
+    // the assumption of it being clamped while working with the bit
+    // representation.
+    temp = PushSystemTemp();
+    in_position_used_ |= 0b0100;
+    DxbcOpMov(
+        DxbcDest::R(temp, 0b0001),
+        DxbcSrc::V(uint32_t(InOutRegister::kPSInPosition), DxbcSrc::kZZZZ),
+        true);
+  }
+
+  DxbcDest temp_x_dest(DxbcDest::R(temp, 0b0001));
+  DxbcSrc temp_x_src(DxbcSrc::R(temp, DxbcSrc::kXXXX));
+  DxbcDest temp_y_dest(DxbcDest::R(temp, 0b0010));
+  DxbcSrc temp_y_src(DxbcSrc::R(temp, DxbcSrc::kYYYY));
+
+  if (GetDxbcShaderModification().depth_stencil_mode ==
+      Modification::DepthStencilMode::kFloat24Truncating) {
+    // Simplified conversion, always less than or equal to the original value -
+    // just drop the lower bits.
+    // The float32 exponent bias is 127.
+    // After saturating, the exponent range is -127...0.
+    // The smallest normalized 20e4 exponent is -14 - should drop 3 mantissa
+    // bits at -14 or above.
+    // The smallest denormalized 20e4 number is -34 - should drop 23 mantissa
+    // bits at -34.
+    // Anything smaller than 2^-34 becomes 0.
+    DxbcDest truncate_dest(shader_writes_depth ? DxbcDest::ODepth()
+                                               : DxbcDest::ODepthLE());
+    // Check if the number is representable as a float24 after truncation - the
+    // exponent is at least -34.
+    DxbcOpUGE(temp_y_dest, temp_x_src, DxbcSrc::LU(0x2E800000));
+    DxbcOpIf(true, temp_y_src);
+    {
+      // Extract the biased float32 exponent to temp.y.
+      // temp.y = 113+ at exponent -14+.
+      // temp.y = 93 at exponent -34.
+      DxbcOpUBFE(temp_y_dest, DxbcSrc::LU(8), DxbcSrc::LU(23), temp_x_src);
+      // Convert exponent to the unclamped number of bits to truncate.
+      // 116 - 113 = 3.
+      // 116 - 93 = 23.
+      // temp.y = 3+ at exponent -14+.
+      // temp.y = 23 at exponent -34.
+      DxbcOpIAdd(temp_y_dest, DxbcSrc::LI(116), -temp_y_src);
+      // Clamp the truncated bit count to drop 3 bits of any normal number.
+      // Exponents below -34 are handled separately.
+      // temp.y = 3 at exponent -14.
+      // temp.y = 23 at exponent -34.
+      DxbcOpIMax(temp_y_dest, temp_y_src, DxbcSrc::LI(3));
+      // Truncate the mantissa - fill the low bits with zeros.
+      DxbcOpBFI(truncate_dest, temp_y_src, DxbcSrc::LU(0), DxbcSrc::LU(0),
+                temp_x_src);
+    }
+    // The number is not representable as float24 after truncation - zero.
+    DxbcOpElse();
+    DxbcOpMov(truncate_dest, DxbcSrc::LF(0.0f));
+    // Close the non-zero result check.
+    DxbcOpEndIf();
+  } else {
+    // Properly convert to 20e4, with rounding to the nearest even.
+    PreClampedDepthTo20e4(temp, 0, temp, 0, temp, 1);
+    // Convert back to float32.
+    // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
+    // Unpack the exponent to temp.y.
+    DxbcOpUShR(temp_y_dest, temp_x_src, DxbcSrc::LU(20));
+    // Unpack the mantissa to temp.x.
+    DxbcOpAnd(temp_x_dest, temp_x_src, DxbcSrc::LU(0xFFFFF));
+    // Check if the number is denormalized.
+    DxbcOpIf(false, temp_y_src);
+    {
+      // Check if the number is non-zero (if the mantissa isn't zero - the
+      // exponent is known to be zero at this point).
+      DxbcOpIf(true, temp_x_src);
+      {
+        // Normalize the mantissa.
+        // Note that HLSL firstbithigh(x) is compiled to DXBC like:
+        // `x ? 31 - firstbit_hi(x) : -1`
+        // (returns the index from the LSB, not the MSB, but -1 for zero too).
+        // temp.y = firstbit_hi(mantissa)
+        DxbcOpFirstBitHi(temp_y_dest, temp_x_src);
+        // temp.y = 20 - firstbithigh(mantissa)
+        // Or:
+        // temp.y = 20 - (31 - firstbit_hi(mantissa))
+        DxbcOpIAdd(temp_y_dest, temp_y_src, DxbcSrc::LI(20 - 31));
+        // mantissa = mantissa << (20 - firstbithigh(mantissa))
+        // AND 0xFFFFF not needed after this - BFI will do it.
+        DxbcOpIShL(temp_x_dest, temp_x_src, temp_y_src);
+        // Get the normalized exponent.
+        // exponent = 1 - (20 - firstbithigh(mantissa))
+        DxbcOpIAdd(temp_y_dest, DxbcSrc::LI(1), -temp_y_src);
+      }
+      // The number is zero.
+      DxbcOpElse();
+      {
+        // Set the unbiased exponent to -112 for zero - 112 will be added later,
+        // resulting in zero float32.
+        DxbcOpMov(temp_y_dest, DxbcSrc::LI(-112));
+      }
+      // Close the non-zero check.
+      DxbcOpEndIf();
+    }
+    // Close the denormal check.
+    DxbcOpEndIf();
+    // Bias the exponent and move it to the correct location in float32 to
+    // temp.y.
+    DxbcOpIMAd(temp_y_dest, temp_y_src, DxbcSrc::LI(1 << 23),
+               DxbcSrc::LI(112 << 23));
+    // Combine the mantissa and the exponent into the result.
+    DxbcOpBFI(DxbcDest::ODepth(), DxbcSrc::LU(20), DxbcSrc::LU(3), temp_x_src,
+              temp_y_src);
+  }
+
+  if (!shader_writes_depth) {
+    // Release temp.
+    PopSystemTemp();
+  }
 }
 
 void DxbcShaderTranslator::CompletePixelShader_ROV_AlphaToMaskSample(
@@ -1937,7 +2104,7 @@ void DxbcShaderTranslator::CompletePixelShader_ROV_AlphaToMaskSample(
 
 void DxbcShaderTranslator::CompletePixelShader_ROV_AlphaToMask() {
   // Check if alpha to coverage can be done at all in this shader.
-  if (!writes_color_target(0)) {
+  if (!current_shader().writes_color_target(0)) {
     return;
   }
 
@@ -1957,7 +2124,7 @@ void DxbcShaderTranslator::CompletePixelShader_ROV_AlphaToMask() {
   // floating-point. With resolution scaling, still using host pixels, to
   // preserve the idea of dithering.
   // temp.x = alpha to coverage offset as float 0.0...3.0.
-  in_position_xy_used_ = true;
+  in_position_used_ |= 0b0011;
   DxbcOpFToU(DxbcDest::R(temp, 0b0011),
              DxbcSrc::V(uint32_t(InOutRegister::kPSInPosition)));
   DxbcOpAnd(DxbcDest::R(temp, 0b0010), DxbcSrc::R(temp, DxbcSrc::kYYYY),
@@ -2067,7 +2234,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
         DxbcOpStoreUAVTyped(
             DxbcDest::U(uav_index_edram_, uint32_t(UAVRegister::kEdram)),
             DxbcSrc::R(system_temp_rov_params_, DxbcSrc::kYYYY), 1,
-            DxbcSrc::R(system_temp_rov_depth_stencil_).Select(i));
+            DxbcSrc::R(system_temp_depth_stencil_).Select(i));
       }
       // Close the write check.
       DxbcOpEndIf();
@@ -2100,8 +2267,10 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   }
 
   // Write color values.
+  uint32_t shader_writes_color_targets =
+      current_shader().writes_color_targets();
   for (uint32_t i = 0; i < 4; ++i) {
-    if (!writes_color_target(i)) {
+    if (!(shader_writes_color_targets & (1 << i))) {
       continue;
     }
 
@@ -2987,7 +3156,7 @@ void DxbcShaderTranslator::CompletePixelShader() {
     return;
   }
 
-  if (writes_color_target(0)) {
+  if (current_shader().writes_color_target(0)) {
     // Alpha test.
     // X - mask, then masked result (SGPR for loading, VGPR for masking).
     // Y - operation result (SGPR for mask operations, VGPR for alpha
@@ -3059,15 +3228,16 @@ void DxbcShaderTranslator::CompletePixelShader() {
     CompletePixelShader_WriteToROV();
   } else {
     CompletePixelShader_WriteToRTVs();
+    CompletePixelShader_DSV_DepthTo24Bit();
   }
 }
 
-void DxbcShaderTranslator::ROV_DepthTo24Bit(uint32_t d24_temp,
-                                            uint32_t d24_temp_component,
-                                            uint32_t d32_temp,
-                                            uint32_t d32_temp_component,
-                                            uint32_t temp_temp,
-                                            uint32_t temp_temp_component) {
+void DxbcShaderTranslator::PreClampedDepthTo20e4(uint32_t d24_temp,
+                                                 uint32_t d24_temp_component,
+                                                 uint32_t d32_temp,
+                                                 uint32_t d32_temp_component,
+                                                 uint32_t temp_temp,
+                                                 uint32_t temp_temp_component) {
   assert_true(temp_temp != d24_temp ||
               temp_temp_component != d24_temp_component);
   assert_true(temp_temp != d32_temp ||
@@ -3079,68 +3249,83 @@ void DxbcShaderTranslator::ROV_DepthTo24Bit(uint32_t d24_temp,
   DxbcDest temp_dest(DxbcDest::R(temp_temp, 1 << temp_temp_component));
   DxbcSrc temp_src(DxbcSrc::R(temp_temp).Select(temp_temp_component));
 
+  // CFloat24 from d3dref9.dll.
+  // Assuming the depth is already clamped to [0, 2) (in all places, the depth
+  // is written with the saturate flag set).
+
+  // Check if the number is too small to be represented as normalized 20e4.
+  // temp = f32 < 2^-14
+  DxbcOpULT(temp_dest, d32_src, DxbcSrc::LU(0x38800000));
+  // Handle denormalized numbers separately.
+  DxbcOpIf(true, temp_src);
+  {
+    // temp = f32 >> 23
+    DxbcOpUShR(temp_dest, d32_src, DxbcSrc::LU(23));
+    // temp = 113 - (f32 >> 23)
+    DxbcOpIAdd(temp_dest, DxbcSrc::LI(113), -temp_src);
+    // Don't allow the shift to overflow, since in DXBC the lower 5 bits of the
+    // shift amount are used (otherwise 0 becomes 8).
+    // temp = min(113 - (f32 >> 23), 24)
+    DxbcOpUMin(temp_dest, temp_src, DxbcSrc::LU(24));
+    // biased_f32 = (f32 & 0x7FFFFF) | 0x800000
+    DxbcOpBFI(d24_dest, DxbcSrc::LU(9), DxbcSrc::LU(23), DxbcSrc::LU(1),
+              d32_src);
+    // biased_f32 = ((f32 & 0x7FFFFF) | 0x800000) >> min(113 - (f32 >> 23), 24)
+    DxbcOpUShR(d24_dest, d24_src, temp_src);
+  }
+  // Not denormalized?
+  DxbcOpElse();
+  {
+    // Bias the exponent.
+    // biased_f32 = f32 + (-112 << 23)
+    // (left shift of a negative value is undefined behavior)
+    DxbcOpIAdd(d24_dest, d32_src, DxbcSrc::LU(0xC8000000u));
+  }
+  // Close the denormal check.
+  DxbcOpEndIf();
+  // Build the 20e4 number.
+  // temp = (biased_f32 >> 3) & 1
+  DxbcOpUBFE(temp_dest, DxbcSrc::LU(1), DxbcSrc::LU(3), d24_src);
+  // f24 = biased_f32 + 3
+  DxbcOpIAdd(d24_dest, d24_src, DxbcSrc::LU(3));
+  // f24 = biased_f32 + 3 + ((biased_f32 >> 3) & 1)
+  DxbcOpIAdd(d24_dest, d24_src, temp_src);
+  // f24 = ((biased_f32 + 3 + ((biased_f32 >> 3) & 1)) >> 3) & 0xFFFFFF
+  DxbcOpUBFE(d24_dest, DxbcSrc::LU(24), DxbcSrc::LU(3), d24_src);
+}
+
+void DxbcShaderTranslator::ROV_DepthTo24Bit(uint32_t d24_temp,
+                                            uint32_t d24_temp_component,
+                                            uint32_t d32_temp,
+                                            uint32_t d32_temp_component,
+                                            uint32_t temp_temp,
+                                            uint32_t temp_temp_component) {
+  assert_true(temp_temp != d32_temp ||
+              temp_temp_component != d32_temp_component);
+  // Source and destination may be the same.
+
   system_constants_used_ |= 1ull << kSysConst_Flags_Index;
-  DxbcOpAnd(temp_dest,
+  DxbcOpAnd(DxbcDest::R(temp_temp, 1 << temp_temp_component),
             DxbcSrc::CB(cbuffer_index_system_constants_,
                         uint32_t(CbufferRegister::kSystemConstants),
                         kSysConst_Flags_Vec)
                 .Select(kSysConst_Flags_Comp),
             DxbcSrc::LU(kSysFlag_ROVDepthFloat24));
   // Convert according to the format.
-  DxbcOpIf(true, temp_src);
+  DxbcOpIf(true, DxbcSrc::R(temp_temp).Select(temp_temp_component));
   {
-    // 20e4 conversion, using 1 VGPR.
-    // CFloat24 from d3dref9.dll.
-    // Assuming the depth is already clamped to [0, 2) (in all places, the depth
-    // is written with the saturate flag set).
-
-    // Check if the number is too small to be represented as normalized 20e4.
-    // temp = f32 < 2^-14
-    DxbcOpULT(temp_dest, d32_src, DxbcSrc::LU(0x38800000));
-    // Handle denormalized numbers separately.
-    DxbcOpIf(true, temp_src);
-    {
-      // temp = f32 >> 23
-      DxbcOpUShR(temp_dest, d32_src, DxbcSrc::LU(23));
-      // temp = 113 - (f32 >> 23)
-      DxbcOpIAdd(temp_dest, DxbcSrc::LI(113), -temp_src);
-      // Don't allow the shift to overflow, since in DXBC the lower 5 bits of
-      // the shift amount are used (otherwise 0 becomes 8).
-      // temp = min(113 - (f32 >> 23), 24)
-      DxbcOpUMin(temp_dest, temp_src, DxbcSrc::LU(24));
-      // biased_f32 = (f32 & 0x7FFFFF) | 0x800000
-      DxbcOpBFI(d24_dest, DxbcSrc::LU(9), DxbcSrc::LU(23), DxbcSrc::LU(1),
-                d32_src);
-      // biased_f32 =
-      //     ((f32 & 0x7FFFFF) | 0x800000) >> min(113 - (f32 >> 23), 24)
-      DxbcOpUShR(d24_dest, d24_src, temp_src);
-    }
-    // Not denormalized?
-    DxbcOpElse();
-    {
-      // Bias the exponent.
-      // biased_f32 = f32 + (-112 << 23)
-      // (left shift of a negative value is undefined behavior)
-      DxbcOpIAdd(d24_dest, d32_src, DxbcSrc::LU(0xC8000000u));
-    }
-    // Close the denormal check.
-    DxbcOpEndIf();
-    // Build the 20e4 number.
-    // temp = (biased_f32 >> 3) & 1
-    DxbcOpUBFE(temp_dest, DxbcSrc::LU(1), DxbcSrc::LU(3), d24_src);
-    // f24 = biased_f32 + 3
-    DxbcOpIAdd(d24_dest, d24_src, DxbcSrc::LU(3));
-    // f24 = biased_f32 + 3 + ((biased_f32 >> 3) & 1)
-    DxbcOpIAdd(d24_dest, d24_src, temp_src);
-    // f24 = ((biased_f32 + 3 + ((biased_f32 >> 3) & 1)) >> 3) & 0xFFFFFF
-    DxbcOpUBFE(d24_dest, DxbcSrc::LU(24), DxbcSrc::LU(3), d24_src);
+    // 20e4 conversion.
+    PreClampedDepthTo20e4(d24_temp, d24_temp_component, d32_temp,
+                          d32_temp_component, temp_temp, temp_temp_component);
   }
   DxbcOpElse();
   {
     // Unorm24 conversion.
-
+    DxbcDest d24_dest(DxbcDest::R(d24_temp, 1 << d24_temp_component));
+    DxbcSrc d24_src(DxbcSrc::R(d24_temp).Select(d24_temp_component));
     // Multiply by float(0xFFFFFF).
-    DxbcOpMul(d24_dest, d32_src, DxbcSrc::LF(16777215.0f));
+    DxbcOpMul(d24_dest, DxbcSrc::R(d32_temp).Select(d32_temp_component),
+              DxbcSrc::LF(16777215.0f));
     // Round to the nearest even integer. This seems to be the correct way:
     // rounding towards zero gives 0xFF instead of 0x100 in clear shaders in,
     // for instance, Halo 3, but other clear shaders in it are also broken if
