@@ -763,11 +763,11 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
-    // For dumping after translation. Dumps the shader's disassembled microcode,
-    // translated code, and, if available, translated disassembly, to a file in
-    // the given path based on ucode hash. Returns the name of the written file.
-    std::filesystem::path Dump(const std::filesystem::path& base_path,
-                               const char* path_prefix);
+    // For dumping after translation. Dumps the shader's translated code, and,
+    // if available, translated disassembly, to files in the given directory
+    // based on ucode hash. Returns {binary path, disassembly path if written}.
+    std::pair<std::filesystem::path, std::filesystem::path> Dump(
+        const std::filesystem::path& base_path, const char* path_prefix) const;
 
    protected:
     Translation(Shader& shader, uint64_t modification)
@@ -836,6 +836,9 @@ class Shader {
   const std::set<uint32_t>& memexport_stream_constants() const {
     return memexport_stream_constants_;
   }
+  bool is_valid_memexport_used() const {
+    return !memexport_stream_constants_.empty();
+  }
 
   // Labels that jumps (explicit or from loops) can be done to.
   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
@@ -892,11 +895,10 @@ class Shader {
     // TODO(Triang3l): Investigate what happens to memexport when the pixel
     // fails the depth/stencil test, but in Direct3D 11 UAV writes disable early
     // depth/stencil.
-    return !writes_depth() && !kills_pixels() &&
-           memexport_stream_constants().empty();
+    return !kills_pixels() && !writes_depth() && !is_valid_memexport_used();
   }
 
-  // Whether each color render target is written to on any exection path.
+  // Whether each color render target is written to on any execution path.
   uint32_t writes_color_targets() const { return writes_color_targets_; }
   bool writes_color_target(uint32_t i) const {
     return (writes_color_targets() & (uint32_t(1) << i)) != 0;
@@ -928,10 +930,12 @@ class Shader {
     ucode_storage_index_ = storage_index;
   }
 
-  // Dumps the shader's microcode binary to a file in the given path based on
-  // ucode hash. Returns the name of the written file. Can be called at any
-  // time, doesn't require the shader to be translated.
-  std::filesystem::path DumpUcodeBinary(const std::filesystem::path& base_path);
+  // Dumps the shader's microcode binary and, if analyzed, disassembly, to files
+  // in the given directory based on ucode hash. Returns the name of the written
+  // file. Can be called at any time, doesn't require the shader to be
+  // translated. Returns {binary path, disassembly path if written}.
+  std::pair<std::filesystem::path, std::filesystem::path> DumpUcode(
+      const std::filesystem::path& base_path) const;
 
  protected:
   friend class ShaderTranslator;
@@ -954,8 +958,9 @@ class Shader {
   // compiled when a new material appears in the game, and having the order of
   // draws also matter in such unpredictable way would break this rule; limit
   // the effect to shaders with dynamic register addressing only, which are
-  // extremely rare), also some info needed for drawing is collected during the
-  // ucode analysis.
+  // extremely rare; however care should be taken regarding depth format-related
+  // translation modifications in this case), also some info needed for drawing
+  // is collected during the ucode analysis.
   bool is_ucode_analyzed_ = false;
 
   std::string ucode_disassembly_;
